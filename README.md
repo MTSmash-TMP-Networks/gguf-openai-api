@@ -362,9 +362,4 @@ Lizenz kann nach Bedarf ergänzt werden (z. B. MIT, Apache 2.0 etc.).
 
 ---
 
-```
-
-Wenn du magst, kann ich dir auch noch eine passende MIT- oder Apache-2.0-Lizenz-Datei generieren, die du einfach als `LICENSE` ins Repo legst.
-::contentReference[oaicite:0]{index=0}
-```
 
