@@ -1,5 +1,3 @@
-Hier ist ein fertiges `README.md`, das du direkt ins Repo legen kannst:
-
 ````markdown
 # GGUF OpenAI-like API (GPU, Multi-Model)
 
