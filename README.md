@@ -1,4 +1,3 @@
-````markdown
 # GGUF OpenAI-like API (GPU, Multi-Model)
 
 Implementierung einer lokalen, OpenAI-kompatiblen Chat-API auf Basis von `llama-cpp-python` und GGUF-Modellen – optimiert für GPU und Multi-Model-Support.
