@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+models/*.gguf
+models/*.bin
+models/*.pth
+models/*.safetensors
+.env
+config/*.env
