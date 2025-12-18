@@ -59,7 +59,7 @@ gguf-openai-api/
 ### 1. Repository klonen
 
 ```bash
-git clone https://github.com/DEINNAME/gguf-openai-api.git
+git clone https://github.com/MTSmash-TMP-Networks/gguf-openai-api.git
 cd gguf-openai-api
 ```
 
