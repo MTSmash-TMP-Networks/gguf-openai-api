@@ -358,8 +358,6 @@ journalctl -u gguf-api -f
 Dieses Projekt wurde von **Marek Templin** im Auftrag der **TMP Networks** entwickelt,
 um lokale GGUF-Modelle komfortabel über eine OpenAI-kompatible API bereitzustellen.
 
-Lizenz kann nach Bedarf ergänzt werden (z. B. MIT, Apache 2.0 etc.).
-
 ---
 
 
