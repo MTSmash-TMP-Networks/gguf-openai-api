@@ -1,4 +1,15 @@
-fastapi
-uvicorn[standard]
-llama-cpp-python
-pydantic
+# Core API
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.6.0
+
+# GGUF Backend (llama.cpp Python bindings)
+llama-cpp-python>=0.2.90
+
+# HF Backend (Transformers)
+torch>=2.2.0
+accelerate>=0.27.0
+safetensors>=0.4.2
+
+# Custom Transformers fork / EVA GPT support
+git+https://github.com/MTSmash-TMP-Networks/transformers-eva-gpt.git@eva-gpt
