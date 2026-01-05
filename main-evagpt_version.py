@@ -13,9 +13,16 @@ from pydantic import BaseModel
 
 from llama_cpp import Llama
 
-# NEU: HF-Imports
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TextIteratorStreamer,
+    StoppingCriteria,
+    StoppingCriteriaList,
+    LogitsProcessor,
+    LogitsProcessorList,
+)
 
 # --------------------------------------------------
 # Environment / GPU
@@ -34,7 +41,7 @@ N_THREADS = int(os.getenv("LLAMA_N_THREADS", str(os.cpu_count() or 4)))
 N_GPU_LAYERS = int(os.getenv("LLAMA_N_GPU_LAYERS", "-1"))
 N_BATCH = int(os.getenv("LLAMA_N_BATCH", "512"))
 
-DEFAULT_MAX_NEW_TOKENS = int(os.getenv("LLAMA_DEFAULT_MAX_TOKENS", "1024"))
+DEFAULT_MAX_NEW_TOKENS = int(os.getenv("LLAMA_DEFAULT_MAX_TOKENS", "8192"))
 CONTEXT_MARGIN_TOKENS = int(os.getenv("LLAMA_CONTEXT_MARGIN_TOKENS", "64"))
 MIN_PROMPT_BUDGET_TOKENS = int(os.getenv("LLAMA_MIN_PROMPT_BUDGET_TOKENS", "256"))
 
@@ -54,13 +61,23 @@ class BaseLLM:
     def detokenize(self, tokens: List[int]) -> str:
         raise NotImplementedError
 
-    def create_completion(self, *, prompt: str, max_tokens: int,
-                          stream: bool = False,
-                          temperature: Optional[float] = None,
-                          top_p: Optional[float] = None,
-                          presence_penalty: Optional[float] = None,
-                          frequency_penalty: Optional[float] = None,
-                          stop: Optional[List[str]] = None):
+    def create_completion(
+        self,
+        *,
+        prompt: str,
+        max_tokens: int,
+        stream: bool = False,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        min_p: Optional[float] = None,
+        typical_p: Optional[float] = None,
+        repeat_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        stop: Optional[List[str]] = None,
+    ):
         raise NotImplementedError
 
 
@@ -90,32 +107,143 @@ class GGUFLLM(BaseLLM):
             return out
         return out.decode("utf-8", errors="ignore")
 
-    def create_completion(self, *, prompt: str, max_tokens: int,
-                          stream: bool = False,
-                          temperature: Optional[float] = None,
-                          top_p: Optional[float] = None,
-                          presence_penalty: Optional[float] = None,
-                          frequency_penalty: Optional[float] = None,
-                          stop: Optional[List[str]] = None):
+    def _call_llama_create_completion(self, kwargs: dict):
+        """
+        Robust gegen unterschiedliche llama_cpp Versionen:
+        - Entfernt ggf. unbekannte Parameter, falls TypeError geworfen wird.
+        """
+        try:
+            return self._llm.create_completion(**kwargs)
+        except TypeError as e:
+            msg = str(e)
+            if "unexpected keyword argument" not in msg:
+                raise
+
+            bad = None
+            # Beispiel: "create_completion() got an unexpected keyword argument 'min_p'"
+            if "'" in msg:
+                parts = msg.split("'")
+                if len(parts) >= 2:
+                    bad = parts[1]
+
+            candidates = ["min_p", "typical_p", "seed", "repeat_penalty", "top_k", "presence_penalty", "frequency_penalty"]
+            if bad:
+                candidates = [bad] + [c for c in candidates if c != bad]
+
+            pruned = dict(kwargs)
+            removed_any = False
+            for k in candidates:
+                if k in pruned:
+                    pruned.pop(k, None)
+                    removed_any = True
+                    try:
+                        return self._llm.create_completion(**pruned)
+                    except TypeError as e2:
+                        msg2 = str(e2)
+                        if "unexpected keyword argument" not in msg2:
+                            raise
+                        continue
+
+            if removed_any:
+                raise
+            raise
+
+    def create_completion(
+        self,
+        *,
+        prompt: str,
+        max_tokens: int,
+        stream: bool = False,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        min_p: Optional[float] = None,
+        typical_p: Optional[float] = None,
+        repeat_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        stop: Optional[List[str]] = None,
+    ):
         kwargs = {
             "prompt": prompt,
-            "max_tokens": max_tokens,
-            "stream": stream,
+            "max_tokens": int(max_tokens),
+            "stream": bool(stream),
         }
         if temperature is not None:
-            kwargs["temperature"] = temperature
+            kwargs["temperature"] = float(temperature)
         if top_p is not None:
-            kwargs["top_p"] = top_p
+            kwargs["top_p"] = float(top_p)
+        if top_k is not None:
+            kwargs["top_k"] = int(top_k)
+        if min_p is not None:
+            kwargs["min_p"] = float(min_p)
+        if typical_p is not None:
+            kwargs["typical_p"] = float(typical_p)
+        if repeat_penalty is not None:
+            kwargs["repeat_penalty"] = float(repeat_penalty)
+        if seed is not None:
+            kwargs["seed"] = int(seed)
         if presence_penalty is not None:
-            kwargs["presence_penalty"] = presence_penalty
+            kwargs["presence_penalty"] = float(presence_penalty)
         if frequency_penalty is not None:
-            kwargs["frequency_penalty"] = frequency_penalty
+            kwargs["frequency_penalty"] = float(frequency_penalty)
         if stop is not None:
             kwargs["stop"] = stop
-        return self._llm.create_completion(**kwargs)
+
+        return self._call_llama_create_completion(kwargs)
 
 
 # ---------------- HF Wrapper ---------------------
+class _StopOnSequences(StoppingCriteria):
+    """
+    Stoppt die Generierung, wenn eines der Stop-Token-Patterns am Ende auftaucht.
+    (Token-basiert, robust auch bei Streaming)
+    """
+    def __init__(self, stop_sequences_token_ids: List[List[int]]):
+        super().__init__()
+        self.stop_seqs = [s for s in stop_sequences_token_ids if s]
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        if not self.stop_seqs:
+            return False
+        seq = input_ids[0].tolist()
+        for s in self.stop_seqs:
+            if len(seq) >= len(s) and seq[-len(s):] == s:
+                return True
+        return False
+
+
+class _OpenAIPenaltiesLogitsProcessor(LogitsProcessor):
+    """
+    Emuliert OpenAI presence_penalty / frequency_penalty für HF:
+      - presence_penalty: zieht penalty von allen Token-Logits ab, die bereits mindestens 1x vorkamen
+      - frequency_penalty: zieht penalty * count(token) ab (basierend auf bisherigen Token-Vorkommen)
+    Hinweis: OpenAI definiert das über bereits generierte + prompt Tokens; das machen wir hier auch.
+    """
+    def __init__(self, presence_penalty: float = 0.0, frequency_penalty: float = 0.0):
+        self.presence_penalty = float(presence_penalty or 0.0)
+        self.frequency_penalty = float(frequency_penalty or 0.0)
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        if (self.presence_penalty == 0.0) and (self.frequency_penalty == 0.0):
+            return scores
+
+        # batch support (auch wenn wir typischerweise batch=1 haben)
+        batch_size = input_ids.shape[0]
+        for b in range(batch_size):
+            ids = input_ids[b]
+            uniq, counts = torch.unique(ids, return_counts=True)
+
+            if self.presence_penalty != 0.0:
+                scores[b, uniq] = scores[b, uniq] - self.presence_penalty
+
+            if self.frequency_penalty != 0.0:
+                scores[b, uniq] = scores[b, uniq] - (self.frequency_penalty * counts.to(scores.dtype))
+
+        return scores
+
+
 class HFLLM(BaseLLM):
     def __init__(self, cfg: dict):
         self.backend = "hf"
@@ -133,7 +261,9 @@ class HFLLM(BaseLLM):
         )
         self.model.eval()
 
-        self.n_ctx = cfg["n_ctx"]
+        # Kontextfenster realistisch begrenzen (HF Modelle haben häufig max_position_embeddings)
+        max_pos = getattr(self.model.config, "max_position_embeddings", cfg["n_ctx"])
+        self.n_ctx = min(int(cfg["n_ctx"]), int(max_pos))
 
     def tokenize(self, text: str) -> List[int]:
         return self.tokenizer(text, add_special_tokens=False).input_ids
@@ -141,36 +271,113 @@ class HFLLM(BaseLLM):
     def detokenize(self, tokens: List[int]) -> str:
         return self.tokenizer.decode(tokens, skip_special_tokens=True)
 
-    def create_completion(self, *, prompt: str, max_tokens: int,
-                          stream: bool = False,
-                          temperature: Optional[float] = None,
-                          top_p: Optional[float] = None,
-                          presence_penalty: Optional[float] = None,
-                          frequency_penalty: Optional[float] = None,
-                          stop: Optional[List[str]] = None):
+    def _filter_gen_kwargs(self, gen_kwargs: dict) -> dict:
+        """
+        Transformers generate() akzeptiert nur bestimmte Keys (über GenerationConfig),
+        plus einige Runtime-Keys. Wir filtern strikt, um ValueError zu vermeiden.
+        """
+        allowed = set(self.model.generation_config.to_dict().keys())
+        runtime_allowed = {
+            "streamer",
+            "stopping_criteria",
+            "logits_processor",
+            "generator",
+        }
+        out = {}
+        for k, v in gen_kwargs.items():
+            if k in allowed or k in runtime_allowed:
+                out[k] = v
+        return out
 
+    def create_completion(
+        self,
+        *,
+        prompt: str,
+        max_tokens: int,
+        stream: bool = False,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        min_p: Optional[float] = None,
+        typical_p: Optional[float] = None,
+        repeat_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        stop: Optional[List[str]] = None,
+    ):
         device = next(self.model.parameters()).device
         inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
 
+        # Optional: deterministische Sampling-Quelle via Generator
+        generator = None
+        if seed is not None:
+            s = int(seed)
+            generator = torch.Generator(device=device)
+            generator.manual_seed(s)
+            # zusätzlich global setzen (hilft bei manchen Pfaden)
+            torch.manual_seed(s)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(s)
+
+        # Stop-Strings als StoppingCriteria (token-basiert)
+        stopping_criteria = None
+        if stop:
+            stop_token_ids = [self.tokenizer.encode(s, add_special_tokens=False) for s in stop if s]
+            if stop_token_ids:
+                stopping_criteria = StoppingCriteriaList([_StopOnSequences(stop_token_ids)])
+
+        # do_sample Logik
+        temp = 1.0 if temperature is None else float(temperature)
+        do_sample = temp > 0.0
+        # Bei greedy (do_sample=False) spielt temperature keine Rolle; wir lassen temp trotzdem sinnvoll.
+        if not do_sample:
+            temp = 1.0
+
+        # presence/frequency penalty emulieren via LogitsProcessor
+        logits_processor = None
+        pp = 0.0 if presence_penalty is None else float(presence_penalty)
+        fp = 0.0 if frequency_penalty is None else float(frequency_penalty)
+        if pp != 0.0 or fp != 0.0:
+            logits_processor = LogitsProcessorList([_OpenAIPenaltiesLogitsProcessor(pp, fp)])
+
         gen_kwargs = {
-            "max_new_tokens": max_tokens,
-            "do_sample": True if (temperature is not None and temperature > 0) else False,
-            "temperature": temperature if temperature is not None else 1.0,
-            "top_p": top_p if top_p is not None else 1.0,
+            "max_new_tokens": int(max_tokens),
+            "do_sample": bool(do_sample),
+            "temperature": float(temp),
+            "top_p": 1.0 if top_p is None else float(top_p),
+            "top_k": int(top_k) if top_k is not None else None,
+            "typical_p": float(typical_p) if typical_p is not None else None,
+            # min_p ist je nach Transformers-Version verfügbar; wir setzen es, filtern aber später.
+            "min_p": float(min_p) if min_p is not None else None,
+            # repeat_penalty -> repetition_penalty (Transformers Naming)
+            "repetition_penalty": float(repeat_penalty) if repeat_penalty is not None else None,
             "eos_token_id": self.tokenizer.eos_token_id,
+            "stopping_criteria": stopping_criteria,
+            "logits_processor": logits_processor,
+            "generator": generator,
         }
 
-        if stop:
-            # einfache Stop-Token-Unterstützung: nur erstes Stop-String als EOS-Token
-            # Für komplexere Patterns bräuchte man Logits-Processor.
-            # Hier nur Minimalversion: ignoriert, wenn kein Token-Match gefunden wird.
-            pass
+        # None-Keys entfernen
+        gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
+
+        # Unbekannte Keys filtern (z.B. min_p, typical_p falls nicht unterstützt)
+        gen_kwargs = self._filter_gen_kwargs(gen_kwargs)
 
         if not stream:
             with torch.no_grad():
                 out = self.model.generate(**inputs, **gen_kwargs)
+
             gen_tokens = out[0][inputs["input_ids"].shape[-1]:]
             text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True)
+
+            # Stop-Strings ggf. hart abschneiden (saubere Ausgabe)
+            if stop:
+                for s in stop:
+                    if s and s in text:
+                        text = text.split(s, 1)[0]
+                        break
+
             return {
                 "choices": [{
                     "text": text,
@@ -179,19 +386,35 @@ class HFLLM(BaseLLM):
             }
 
         # Streaming mit TextIteratorStreamer
-        streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
-        gen_kwargs_stream = dict(inputs, **gen_kwargs, streamer=streamer)
+        streamer = TextIteratorStreamer(
+            self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True
+        )
+        gen_kwargs_stream = dict(gen_kwargs)
+        gen_kwargs_stream["streamer"] = streamer
+        gen_kwargs_stream = self._filter_gen_kwargs(gen_kwargs_stream)
 
         def _run():
             with torch.no_grad():
-                self.model.generate(**gen_kwargs_stream)
+                self.model.generate(**inputs, **gen_kwargs_stream)
 
-        import threading as _threading
-        t = _threading.Thread(target=_run)
+        t = threading.Thread(target=_run, daemon=True)
         t.start()
 
         def iterator():
             for new_text in streamer:
+                if stop:
+                    for s in stop:
+                        if s and s in new_text:
+                            yield {
+                                "choices": [{
+                                    "text": new_text.split(s, 1)[0],
+                                    "finish_reason": "stop",
+                                }]
+                            }
+                            return
+
                 yield {
                     "choices": [{
                         "text": new_text,
@@ -199,7 +422,15 @@ class HFLLM(BaseLLM):
                     }]
                 }
 
+            yield {
+                "choices": [{
+                    "text": "",
+                    "finish_reason": "stop",
+                }]
+            }
+
         return iterator()
+
 
 # --------------------------------------------------
 # Model-Registry: GGUF + HF
@@ -274,6 +505,8 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = None
     messages: List[ChatMessage]
+
+    # OpenAI-like
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
@@ -281,6 +514,19 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
+
+    # ctx budget pro Request (<= geladenes Model-n_ctx)
+    ctx: Optional[int] = None
+    # Aliases, falls du es anders nennen willst
+    context_window: Optional[int] = None
+    n_ctx: Optional[int] = None
+
+    # Sampling/Control Parameter
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    typical_p: Optional[float] = None
+    repeat_penalty: Optional[float] = None
+    seed: Optional[int] = None
 
 class ChatCompletionResponseChoiceMessage(BaseModel):
     role: Literal["assistant"]
@@ -368,8 +614,10 @@ def chat_completions(body: ChatCompletionRequest):
 def render_messages_to_prompt(messages: List[ChatMessage]) -> str:
     if not messages:
         return "<|System|>\n</s>\n<|Benutzer|>\n</s>\n<|Assistentin|>"
+
     system_parts = [m.content for m in messages if m.role == "system"]
     system_text = "\n".join(system_parts).strip()
+
     last_user_idx: Optional[int] = None
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].role == "user":
@@ -377,11 +625,14 @@ def render_messages_to_prompt(messages: List[ChatMessage]) -> str:
             break
     if last_user_idx is None:
         last_user_idx = len(messages) - 1
+
     prompt_msg = messages[last_user_idx].content
+
     history_msgs: List[ChatMessage] = [
         m for i, m in enumerate(messages)
         if i < last_user_idx and m.role != "system"
     ]
+
     history_lines: List[str] = []
     for m in history_msgs:
         if m.role == "user":
@@ -392,9 +643,11 @@ def render_messages_to_prompt(messages: List[ChatMessage]) -> str:
             history_lines.append("<|Assistentin|>")
             history_lines.append(m.content)
             history_lines.append("</s>")
+
     history_text = ""
     if history_lines:
         history_text = "\n".join(history_lines) + "\n"
+
     parts: List[str] = []
     parts.append("<|System|>")
     parts.append(system_text)
@@ -440,6 +693,27 @@ def _normalize_stop(stop: Optional[Union[str, List[str]]]) -> Optional[List[str]
     stop = [s for s in stop if s]
     return stop or None
 
+def get_effective_n_ctx(llm: BaseLLM, body: ChatCompletionRequest, model_id: str) -> int:
+    base_cfg = int(MODEL_CONFIGS[model_id]["n_ctx"])
+    base_llm = int(getattr(llm, "n_ctx", base_cfg))
+    base = min(base_cfg, base_llm)
+
+    req = body.ctx
+    if req is None:
+        req = body.context_window
+    if req is None:
+        req = body.n_ctx
+
+    if req is None:
+        return base
+
+    try:
+        requested = int(req)
+    except Exception:
+        return base
+
+    return max(512, min(requested, base))
+
 def _requested_new_tokens(body: ChatCompletionRequest, n_ctx: int) -> int:
     req = body.max_tokens if body.max_tokens is not None else DEFAULT_MAX_NEW_TOKENS
     try:
@@ -453,12 +727,12 @@ def _requested_new_tokens(body: ChatCompletionRequest, n_ctx: int) -> int:
 
 def fit_messages_to_context(
     llm: BaseLLM,
-    model_id: str,
+    n_ctx: int,
     messages: List[ChatMessage],
     reserved_new_tokens: int,
 ) -> Tuple[List[ChatMessage], str, int, int]:
-    n_ctx = MODEL_CONFIGS[model_id]["n_ctx"]
     prompt_budget = max(1, n_ctx - reserved_new_tokens - CONTEXT_MARGIN_TOKENS)
+
     if not messages:
         prompt = render_messages_to_prompt(messages)
         prompt_tokens = count_tokens(llm, prompt)
@@ -466,6 +740,7 @@ def fit_messages_to_context(
         return messages, prompt, prompt_tokens, min(reserved_new_tokens, available)
 
     system_msgs = [m for m in messages if m.role == "system"]
+
     last_user_idx: Optional[int] = None
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].role == "user":
@@ -473,22 +748,27 @@ def fit_messages_to_context(
             break
     if last_user_idx is None:
         last_user_idx = len(messages) - 1
+
     prompt_msg = messages[last_user_idx]
     if prompt_msg.role != "user":
         prompt_msg = ChatMessage(role="user", content=prompt_msg.content)
+
     history_msgs: List[ChatMessage] = [
         m for i, m in enumerate(messages)
         if i < last_user_idx and m.role != "system"
     ]
+
     trimmed_history = history_msgs[:]
     final_msgs = system_msgs + trimmed_history + [prompt_msg]
     prompt = render_messages_to_prompt(final_msgs)
     prompt_tokens = count_tokens(llm, prompt)
+
     while prompt_tokens > prompt_budget and trimmed_history:
         trimmed_history.pop(0)
         final_msgs = system_msgs + trimmed_history + [prompt_msg]
         prompt = render_messages_to_prompt(final_msgs)
         prompt_tokens = count_tokens(llm, prompt)
+
     if prompt_tokens > prompt_budget:
         overshoot = prompt_tokens - prompt_budget
         user_toks = _tokenize(llm, prompt_msg.content)
@@ -500,6 +780,7 @@ def fit_messages_to_context(
         final_msgs = system_msgs + trimmed_history + [prompt_msg]
         prompt = render_messages_to_prompt(final_msgs)
         prompt_tokens = count_tokens(llm, prompt)
+
     if prompt_tokens > prompt_budget and system_msgs:
         system_text = "\n".join([m.content for m in system_msgs]).strip()
         overshoot = prompt_tokens - prompt_budget
@@ -510,12 +791,13 @@ def fit_messages_to_context(
         final_msgs = system_msgs + trimmed_history + [prompt_msg]
         prompt = render_messages_to_prompt(final_msgs)
         prompt_tokens = count_tokens(llm, prompt)
+
     available_new = max(0, n_ctx - prompt_tokens - 1)
     max_new_tokens_final = min(reserved_new_tokens, available_new)
     return final_msgs, prompt, prompt_tokens, max_new_tokens_final
 
 # --------------------------------------------------
-# Completion-Aufruf (nutzt jetzt BaseLLM.create_completion)
+# Completion-Aufruf (nutzt BaseLLM.create_completion)
 # --------------------------------------------------
 def build_completion_kwargs(
     body: ChatCompletionRequest,
@@ -523,28 +805,34 @@ def build_completion_kwargs(
     stream: bool,
     max_tokens: int,
 ):
-    kwargs = {
+    return {
         "prompt": prompt,
         "max_tokens": max_tokens,
         "stream": stream,
         "temperature": body.temperature,
         "top_p": body.top_p,
+        "top_k": body.top_k,
+        "min_p": body.min_p,
+        "typical_p": body.typical_p,
+        "repeat_penalty": body.repeat_penalty,
+        "seed": body.seed,
         "presence_penalty": body.presence_penalty,
         "frequency_penalty": body.frequency_penalty,
         "stop": _normalize_stop(body.stop),
     }
-    return kwargs
 
 def non_stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: threading.Lock):
     with lock:
-        n_ctx = MODEL_CONFIGS[model_id]["n_ctx"]
-        reserved = _requested_new_tokens(body, n_ctx)
+        effective_n_ctx = get_effective_n_ctx(llm, body, model_id)
+        reserved = _requested_new_tokens(body, effective_n_ctx)
+
         _final_msgs, prompt, prompt_tokens, max_new = fit_messages_to_context(
             llm=llm,
-            model_id=model_id,
+            n_ctx=effective_n_ctx,
             messages=body.messages,
             reserved_new_tokens=reserved,
         )
+
         if max_new <= 0:
             text = ""
             finish_reason = "stop"
@@ -557,18 +845,22 @@ def non_stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lo
                 if not is_context_error(e):
                     raise
                 minimal = [m for m in body.messages if m.role == "system"]
-                last_user = next((m for m in reversed(body.messages) if m.role == "user"),
-                                 ChatMessage(role="user", content=""))
+                last_user = next(
+                    (m for m in reversed(body.messages) if m.role == "user"),
+                    ChatMessage(role="user", content="")
+                )
                 minimal.append(last_user)
                 _final_msgs, prompt, prompt_tokens, max_new = fit_messages_to_context(
-                    llm=llm, model_id=model_id, messages=minimal, reserved_new_tokens=reserved
+                    llm=llm, n_ctx=effective_n_ctx, messages=minimal, reserved_new_tokens=reserved
                 )
                 kwargs = build_completion_kwargs(body, prompt, stream=False, max_tokens=max_new)
                 result = llm.create_completion(**kwargs)
+
             choice = result["choices"][0]
             text = choice.get("text", "")
             finish_reason = choice.get("finish_reason", "stop")
             completion_tokens = len(_tokenize(llm, text))
+
     now = int(time.time())
     response = ChatCompletionResponse(
         id=f"chatcmpl-{now}-{uuid4().hex[:8]}",
@@ -597,15 +889,18 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
     def event_stream():
         created = int(time.time())
         stream_id = f"chatcmpl-{created}-{uuid4().hex[:8]}"
+
         with lock:
-            n_ctx = MODEL_CONFIGS[model_id]["n_ctx"]
-            reserved = _requested_new_tokens(body, n_ctx)
+            effective_n_ctx = get_effective_n_ctx(llm, body, model_id)
+            reserved = _requested_new_tokens(body, effective_n_ctx)
+
             _final_msgs, prompt, _prompt_tokens, max_new = fit_messages_to_context(
                 llm=llm,
-                model_id=model_id,
+                n_ctx=effective_n_ctx,
                 messages=body.messages,
                 reserved_new_tokens=reserved,
             )
+
             yield sse({
                 "id": stream_id,
                 "object": "chat.completion.chunk",
@@ -617,6 +912,7 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
                     "finish_reason": None,
                 }],
             })
+
             if max_new <= 0:
                 yield sse({
                     "id": stream_id,
@@ -631,50 +927,64 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
                 })
                 yield "data: [DONE]\n\n"
                 return
+
             kwargs = build_completion_kwargs(body, prompt, stream=True, max_tokens=max_new)
+
             try:
                 iterator = llm.create_completion(**kwargs)
             except ValueError as e:
                 if not is_context_error(e):
                     raise
                 minimal = [m for m in body.messages if m.role == "system"]
-                last_user = next((m for m in reversed(body.messages) if m.role == "user"),
-                                 ChatMessage(role="user", content=""))
+                last_user = next(
+                    (m for m in reversed(body.messages) if m.role == "user"),
+                    ChatMessage(role="user", content="")
+                )
                 minimal.append(last_user)
                 _final_msgs, prompt, _prompt_tokens, max_new = fit_messages_to_context(
-                    llm=llm, model_id=model_id, messages=minimal, reserved_new_tokens=reserved
+                    llm=llm, n_ctx=effective_n_ctx, messages=minimal, reserved_new_tokens=reserved
                 )
                 kwargs = build_completion_kwargs(body, prompt, stream=True, max_tokens=max_new)
                 iterator = llm.create_completion(**kwargs)
 
             buf = ""
             last_flush = time.monotonic()
+            stopped_early = False
+
             try:
                 for chunk in iterator:
                     choice = chunk["choices"][0]
                     delta = choice.get("text", "")
-                    if not delta:
-                        continue
-                    buf += delta
-                    now = time.monotonic()
+                    finish_reason = choice.get("finish_reason", None)
+
+                    if delta:
+                        buf += delta
+
+                    now_m = time.monotonic()
                     if (
                         len(buf) >= STREAM_BUFFER_CHARS
                         or "\n" in buf
-                        or (now - last_flush) >= STREAM_FLUSH_INTERVAL_SEC
+                        or (now_m - last_flush) >= STREAM_FLUSH_INTERVAL_SEC
                     ):
-                        yield sse({
-                            "id": stream_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_id,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": buf},
-                                "finish_reason": None,
-                            }],
-                        })
-                        buf = ""
-                        last_flush = now
+                        if buf:
+                            yield sse({
+                                "id": stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": buf},
+                                    "finish_reason": None,
+                                }],
+                            })
+                            buf = ""
+                            last_flush = now_m
+
+                    if finish_reason == "stop":
+                        stopped_early = True
+                        break
+
                 if buf:
                     yield sse({
                         "id": stream_id,
@@ -687,6 +997,7 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
                             "finish_reason": None,
                         }],
                     })
+
                 yield sse({
                     "id": stream_id,
                     "object": "chat.completion.chunk",
@@ -699,6 +1010,7 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
                     }],
                 })
                 yield "data: [DONE]\n\n"
+
             except GeneratorExit:
                 return
 
