@@ -1,6 +1,6 @@
-# GGUF OpenAI-like API (GPU, Multi-Model)
+# GGUF + HF OpenAI-like API (GPU, Multi-Model, Streaming)
 
-Implementierung einer lokalen, OpenAI-kompatiblen Chat-API auf Basis von `llama-cpp-python` und GGUF-Modellen – optimiert für GPU und Multi-Model-Support.
+Lokale, OpenAI-kompatible Chat-API auf Basis von **GGUF (llama-cpp-python)** *und* **Hugging Face Transformers (HF)** – optimiert für GPU, Multi-Model-Support und Streaming.
 
 > Entwickelt von **Marek Templin**  
 > im Auftrag der **TMP Networks**
@@ -9,17 +9,28 @@ Implementierung einer lokalen, OpenAI-kompatiblen Chat-API auf Basis von `llama-
 
 ## Features
 
-- 🧠 **GGUF-Modelle** (lokal, komplett offline)
-- 🔁 **OpenAI-kompatible API**:
+- 🧠 **Zwei Backends**
+  - **GGUF / llama-cpp-python** (offline, lokal, sehr performant – ideal für GGUF)
+  - **HF / Transformers** (lokale HF-Modelle, optional GPU via `device_map="auto"`)
+- 🔁 **OpenAI-kompatible API**
   - `POST /v1/chat/completions`
   - `GET /v1/models`
-- 🎛️ **Multi-Model-Support**:
-  - alle `.gguf`-Dateien aus einem Ordner werden automatisch erkannt
-  - Auswahl über `model`-Parameter im Request
-- 🚀 **GPU-Unterstützung** (CUDA) mit `llama-cpp-python`
-- 🎚️ **Sampling-Parameter über API steuerbar**:
-  - `max_tokens`, `temperature`, `top_p`, `stop`, `presence_penalty`, `frequency_penalty`
+- 🎛️ **Multi-Model-Support (Auto-Discovery)**
+  - alle `.gguf`-Dateien aus `GGUF_MODELS_DIR` werden erkannt
+  - jeder Unterordner in `HF_MODELS_DIR` gilt als HF-Modell
+  - Auswahl über `model` im Request
+- 🚀 **GPU-Unterstützung**
+  - GGUF via `LLAMA_N_GPU_LAYERS`
+  - HF via CUDA + `device_map="auto"`
+- 🎚️ **Sampling/Control Parameter per API**
+  - `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `typical_p`
+  - `repeat_penalty`, `seed`
+  - `presence_penalty`, `frequency_penalty` *(GGUF nativ; HF via LogitsProcessor emuliert)*
+  - `stop` (String oder Liste)
 - 📡 **Streaming-Support** (`stream: true`) via Server-Sent-Events (SSE)
+- 🧠 **Kontextbudget pro Request**
+  - `ctx` (Alias: `context_window`, `n_ctx`) begrenzt die genutzte History im Request
+  - Hinweis: `ctx` kann nur **≤** dem beim Modell gesetzten Kontextfenster sein
 - 🩺 **Healthcheck**: `GET /health`
 - ⚙️ **systemd-Service**-Konfiguration für Dauerbetrieb unter Linux
 
@@ -37,8 +48,10 @@ gguf-openai-api/
 ├─ config/
 │  ├─ gguf-api.service.example
 │  └─ gguf-api.env.example
-├─ models/
+├─ models_gguf/
 │  └─ (hier liegen deine .gguf-Modelle, nicht ins Repo committen)
+├─ models_hf/
+│  └─ (hier liegen HF-Modelle als Unterordner, nicht ins Repo committen)
 └─ .gitignore
 ````
 
@@ -49,22 +62,25 @@ gguf-openai-api/
 * Linux (getestet unter Ubuntu/Debian-ähnlich)
 * Python 3.11 (empfohlen)
 * NVIDIA GPU mit aktuellem Treiber + CUDA Runtime (z. B. CUDA 12.x)
-* GGUF-Modelle (z. B. LLaMA 3, Mistral, deutsche Modelle etc.)
+* Modelle:
+
+  * **GGUF**: `.gguf` Dateien (z. B. LLaMA/Mistral Derivate)
+  * **HF**: lokale Model-Folder (z. B. ein Ordner aus `transformers` / `snapshot_download`)
 
 ---
 
 ## Installation
 
-### 1. Repository klonen
+### 1) Repository klonen
 
 ```bash
 git clone https://github.com/MTSmash-TMP-Networks/gguf-openai-api.git
 cd gguf-openai-api
 ```
 
-### 2. Python-Abhängigkeiten installieren
+### 2) Python-Abhängigkeiten installieren
 
-Optional: virtuelles Environment anlegen:
+Optional: virtuelles Environment anlegen
 
 ```bash
 python3.11 -m venv .venv
@@ -79,43 +95,60 @@ pip install -r requirements.txt
 ```
 
 > Hinweis: Für GPU solltest du `llama-cpp-python` als CUDA-Build installiert haben
-> (z. B. via extra-index `cu124/cu121`).
-> Das hängt von deiner CUDA-Version ab.
+> (z. B. via extra-index passend zu deiner CUDA-Version).
+> HF nutzt CUDA über dein installiertes `torch`.
 
-### 3. Modelle vorbereiten
+---
 
-Lege deine `.gguf`-Dateien in den `models/`-Ordner, z. B.:
+## Modelle vorbereiten
+
+### GGUF
+
+Lege `.gguf`-Dateien in den GGUF-Ordner (Default: `./models_gguf`), z. B.:
 
 ```text
-models/
+models_gguf/
   EvaGPT-German-X-LlamaTok-DE-7B-f16.gguf
   Meta-Llama-3-8B-Instruct.Q4_K_M.gguf
 ```
 
-Beim Start des Servers werden alle `.gguf`-Dateien in diesem Ordner automatisch erkannt und unter ihrer Dateibasis (ohne `.gguf`) als Model-ID registriert.
+Model-ID = Dateiname ohne `.gguf`.
 
-Beispiele:
+### HF (Transformers)
 
-* Datei `EvaGPT-German-X-LlamaTok-DE-7B-f16.gguf` → Model-ID `EvaGPT-German-X-LlamaTok-DE-7B-f16`
-* Datei `Meta-Llama-3-8B-Instruct.Q4_K_M.gguf` → Model-ID `Meta-Llama-3-8B-Instruct.Q4_K_M`
+Jeder Unterordner in `HF_MODELS_DIR` (Default: `./models_hf`) wird als Modell registriert:
+
+```text
+models_hf/
+  mistral-7b-instruct/
+    config.json
+    tokenizer.json
+    model.safetensors
+    ...
+```
+
+Model-ID = Ordnername (z. B. `mistral-7b-instruct`).
 
 ---
 
 ## Konfiguration (Environment)
 
-Standardmäßig:
+Standardwerte (sofern nicht per ENV überschrieben):
 
-* `MODELS_DIR = ./models`
-* `CUDA_VISIBLE_DEVICES = 0`
-* `LLAMA_N_CTX = 4096`
-* `LLAMA_N_GPU_LAYERS = -1` (so viele Layers wie möglich auf die GPU)
-* `LLAMA_N_BATCH = 512`
+* `GGUF_MODELS_DIR=./models_gguf`
+* `HF_MODELS_DIR=./models_hf`
+* `CUDA_VISIBLE_DEVICES=0`
+* `LLAMA_N_CTX=8192`
+* `LLAMA_N_GPU_LAYERS=-1` (so viele Layers wie möglich auf die GPU)
+* `LLAMA_N_BATCH=512`
+* `LLAMA_N_THREADS=<CPU count>`
 
-Diese Werte können über Environment-Variablen angepasst werden, z. B.:
+Beispiel:
 
 ```bash
-export GGUF_MODELS_DIR=/pfad/zu/models
-export LLAMA_N_CTX=4096
+export GGUF_MODELS_DIR=/pfad/zu/models_gguf
+export HF_MODELS_DIR=/pfad/zu/models_hf
+export LLAMA_N_CTX=8192
 export LLAMA_N_GPU_LAYERS=-1
 export LLAMA_N_BATCH=512
 export LLAMA_N_THREADS=8
@@ -123,7 +156,7 @@ export CUDA_VISIBLE_DEVICES=0
 export LLAMA_LOG_LEVEL=info
 ```
 
-Beispiel-Env-Datei findest du unter `config/gguf-api.env.example`.
+Beispiel-Env-Datei: `config/gguf-api.env.example`
 
 ---
 
@@ -135,9 +168,11 @@ Im Projektordner:
 python3.11 main.py
 ```
 
-Standardmäßig lauscht der Server auf:
+Der Server lauscht standardmäßig auf:
 
-* **[http://127.0.0.1:8000](http://127.0.0.1:8000)**
+* `http://0.0.0.0:8023`
+
+> Falls du in deiner Umgebung einen anderen Port nutzt: bitte `uvicorn.run(..., port=XXXX)` anpassen.
 
 ---
 
@@ -145,10 +180,8 @@ Standardmäßig lauscht der Server auf:
 
 ### `GET /health`
 
-Einfacher Healthcheck:
-
 ```bash
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8023/health
 ```
 
 Beispiel-Antwort:
@@ -157,10 +190,7 @@ Beispiel-Antwort:
 {
   "status": "ok",
   "default_model": "EvaGPT-German-X-LlamaTok-DE-7B-f16",
-  "models": [
-    "EvaGPT-German-X-LlamaTok-DE-7B-f16",
-    "Meta-Llama-3-8B-Instruct.Q4_K_M"
-  ]
+  "models": ["EvaGPT-German-X-LlamaTok-DE-7B-f16", "mistral-7b-instruct"]
 }
 ```
 
@@ -168,10 +198,8 @@ Beispiel-Antwort:
 
 ### `GET /v1/models`
 
-Liste aller verfügbaren Modelle (OpenAI-kompatibler Stil):
-
 ```bash
-curl http://127.0.0.1:8000/v1/models
+curl http://127.0.0.1:8023/v1/models
 ```
 
 Beispiel:
@@ -184,13 +212,15 @@ Beispiel:
       "id": "EvaGPT-German-X-LlamaTok-DE-7B-f16",
       "object": "model",
       "owned_by": "local",
-      "root": "./models/EvaGPT-German-X-LlamaTok-DE-7B-f16.gguf"
+      "root": "./models_gguf/EvaGPT-German-X-LlamaTok-DE-7B-f16.gguf",
+      "backend": "gguf"
     },
     {
-      "id": "Meta-Llama-3-8B-Instruct.Q4_K_M",
+      "id": "mistral-7b-instruct",
       "object": "model",
       "owned_by": "local",
-      "root": "./models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
+      "root": "./models_hf/mistral-7b-instruct",
+      "backend": "hf"
     }
   ]
 }
@@ -198,11 +228,11 @@ Beispiel:
 
 ---
 
-### `POST /v1/chat/completions`
+## `POST /v1/chat/completions`
 
-OpenAI-kompatibler Chat-Endpunkt.
+OpenAI-kompatibler Chat-Endpunkt (inkl. System-Prompt über `messages`).
 
-#### Request-Body (Beispiel, ohne Streaming)
+### Request-Body (Beispiel, ohne Streaming)
 
 ```json
 {
@@ -211,38 +241,64 @@ OpenAI-kompatibler Chat-Endpunkt.
     { "role": "system", "content": "Du bist ein hilfreicher Assistent." },
     { "role": "user", "content": "Erklär mir kurz, was ein GGUF-Modell ist." }
   ],
-  "max_tokens": -1,
+  "ctx": 4096,
+  "max_tokens": 256,
   "temperature": 0.7,
   "top_p": 0.95,
+  "top_k": 40,
+  "typical_p": 0.95,
+  "min_p": 0.05,
+  "repeat_penalty": 1.1,
+  "presence_penalty": 0.3,
+  "frequency_penalty": 0.2,
+  "seed": 123,
+  "stop": ["</s>"],
   "stream": false
 }
 ```
 
-* `model` *(optional)*: Model-ID (siehe `/v1/models`), wenn weggelassen → Default-Modell
-* `messages`: Liste der Konversationsnachrichten im OpenAI-Format
-* `max_tokens`:
+### Parameter-Übersicht
 
-  * `> 0`: maximale Anzahl Tokens für die Antwort
-  * `-1` oder `null`: wird als `None` an `llama-cpp-python` übergeben, d. h. das Modell entscheidet selbst (bis EOS oder Kontextgrenze)
-* `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `stop` *(optional)*:
+* `model` *(optional)*: Model-ID aus `/v1/models` – wenn weggelassen: Default-Modell
+* `messages`: Konversation im OpenAI-Format (`system`, `user`, `assistant`)
+* `ctx` *(optional)*: Kontextbudget pro Request (Alias: `context_window`, `n_ctx`)
 
-  * wenn nicht gesetzt → `llama-cpp-python` verwendet seine Defaults
+  * begrenzt, wie viel History in den Prompt passt (wird automatisch gekürzt)
+  * muss **≤** dem Modell-Kontextfenster sein
+* `max_tokens` *(optional)*: maximale neue Tokens in der Antwort (wird intern sinnvoll begrenzt)
+* Sampling/Control:
+
+  * `temperature`, `top_p`, `top_k`, `typical_p`, `min_p`
+  * `repeat_penalty`
+  * `seed` (deterministischer Sampling-Seed, soweit Backend unterstützt)
+* Penalties:
+
+  * `presence_penalty`, `frequency_penalty`
+
+    * **GGUF:** nativ (sofern llama.cpp-build es unterstützt)
+    * **HF:** emuliert via LogitsProcessor (OpenAI-ähnliche Wirkung)
+* `stop` *(optional)*: String oder Liste von Strings
+
+  * HF: token-basierter Stop + sauberes Abschneiden
+  * GGUF: wird an llama.cpp übergeben (wenn unterstützt)
 * `stream`:
 
   * `false`: normale Antwort
-  * `true`: Streaming via Server-Sent-Events (SSE)
+  * `true`: Streaming via SSE
 
-#### Beispiel mit `curl`
+### Curl-Beispiel
 
 ```bash
-curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+curl -X POST http://127.0.0.1:8023/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "EvaGPT-German-X-LlamaTok-DE-7B-f16",
     "messages": [
       { "role": "user", "content": "Schreib mir einen kurzen deutschen Satz." }
     ],
-    "max_tokens": -1,
+    "ctx": 4096,
+    "max_tokens": 128,
+    "temperature": 0.7,
     "stream": false
   }'
 ```
@@ -261,8 +317,8 @@ Beispiel:
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://127.0.0.1:8000/v1",
-    api_key="not-needed",  # wird ignoriert
+    base_url="http://127.0.0.1:8023/v1",
+    api_key="not-needed",
 )
 
 resp = client.chat.completions.create(
@@ -271,7 +327,14 @@ resp = client.chat.completions.create(
         {"role": "system", "content": "Du bist ein hilfreicher Assistent."},
         {"role": "user", "content": "Was ist der Unterschied zwischen CPU und GPU?"}
     ],
-    max_tokens=-1,
+    # Zusätzliche Felder funktionieren, wenn dein Client sie durchlässt:
+    extra_body={
+        "ctx": 4096,
+        "top_k": 40,
+        "repeat_penalty": 1.1,
+        "seed": 123,
+    },
+    max_tokens=256,
 )
 
 print(resp.choices[0].message.content)
@@ -282,55 +345,56 @@ print(resp.choices[0].message.content)
 ```python
 stream = client.chat.completions.create(
     model="EvaGPT-German-X-LlamaTok-DE-7B-f16",
-    messages=[
-        {"role": "user", "content": "Erzähl mir eine kurze Geschichte."}
-    ],
+    messages=[{"role": "user", "content": "Erzähl mir eine kurze Geschichte."}],
     stream=True,
+    extra_body={"ctx": 4096, "seed": 123},
 )
 
 for chunk in stream:
     delta = chunk.choices[0].delta
-    if delta.content:
+    if delta and getattr(delta, "content", None):
         print(delta.content, end="", flush=True)
 print()
 ```
+
+> Hinweis: Manche OpenAI-Client-Versionen akzeptieren Custom-Parameter nur über `extra_body`.
 
 ---
 
 ## Betrieb als systemd-Service (Linux)
 
-### 1. Env-Datei anlegen
-
-Beispiel (angepasst von `config/gguf-api.env.example`):
+### 1) Env-Datei anlegen
 
 ```bash
 sudo cp config/gguf-api.env.example /etc/default/gguf-api
 sudo nano /etc/default/gguf-api
 ```
 
-Dort Pfade & Werte anpassen, z. B.:
+Beispiel:
 
 ```bash
-GGUF_MODELS_DIR=/home/deinuser/gguf-openai-api/models
-LLAMA_N_CTX=4096
+GGUF_MODELS_DIR=/home/deinuser/gguf-openai-api/models_gguf
+HF_MODELS_DIR=/home/deinuser/gguf-openai-api/models_hf
+LLAMA_N_CTX=8192
 LLAMA_N_GPU_LAYERS=-1
 LLAMA_N_BATCH=512
 LLAMA_N_THREADS=8
+CUDA_VISIBLE_DEVICES=0
 ```
 
-### 2. systemd-Unit anlegen
+### 2) systemd-Unit anlegen
 
 ```bash
 sudo cp config/gguf-api.service.example /etc/systemd/system/gguf-api.service
 sudo nano /etc/systemd/system/gguf-api.service
 ```
 
-Wichtige Punkte:
+Wichtig:
 
-* `User=` & `Group=` auf deinen Linux-User setzen
-* `WorkingDirectory=` & `ExecStart=` ggf. anpassen
+* `User=` & `Group=` anpassen
+* `WorkingDirectory=` & `ExecStart=` anpassen (inkl. korrektem Port)
 
-### 3. Service aktivieren und starten
+### 3) Service aktivieren und starten
 
 ```bash
 sudo systemctl daemon-reload
@@ -355,8 +419,4 @@ journalctl -u gguf-api -f
 ## Lizenz / Nutzung
 
 Dieses Projekt wurde von **Marek Templin** im Auftrag der **TMP Networks** entwickelt,
-um lokale GGUF-Modelle komfortabel über eine OpenAI-kompatible API bereitzustellen.
-
----
-
-
+um lokale GGUF- und HF-Modelle komfortabel über eine OpenAI-kompatible API bereitzustellen.
