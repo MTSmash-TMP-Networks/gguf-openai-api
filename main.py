@@ -48,6 +48,9 @@ MIN_PROMPT_BUDGET_TOKENS = int(os.getenv("LLAMA_MIN_PROMPT_BUDGET_TOKENS", "256"
 STREAM_BUFFER_CHARS = int(os.getenv("LLAMA_STREAM_BUFFER_CHARS", "48"))
 STREAM_FLUSH_INTERVAL_SEC = float(os.getenv("LLAMA_STREAM_FLUSH_INTERVAL_SEC", "0.04"))
 
+# Timeout für „stille“ Streams (Sekunden ohne neue Tokens)
+STREAM_TIMEOUT_SEC = float(os.getenv("LLAMA_STREAM_TIMEOUT_SEC", "60.0"))
+
 # --------------------------------------------------
 # Wrapper-Interface für beide Backend-Typen
 # --------------------------------------------------
@@ -216,10 +219,7 @@ class _StopOnSequences(StoppingCriteria):
 
 class _OpenAIPenaltiesLogitsProcessor(LogitsProcessor):
     """
-    Emuliert OpenAI presence_penalty / frequency_penalty für HF:
-      - presence_penalty: zieht penalty von allen Token-Logits ab, die bereits mindestens 1x vorkamen
-      - frequency_penalty: zieht penalty * count(token) ab (basierend auf bisherigen Token-Vorkommen)
-    Hinweis: OpenAI definiert das über bereits generierte + prompt Tokens; das machen wir hier auch.
+    Emuliert OpenAI presence_penalty / frequency_penalty für HF.
     """
     def __init__(self, presence_penalty: float = 0.0, frequency_penalty: float = 0.0):
         self.presence_penalty = float(presence_penalty or 0.0)
@@ -229,7 +229,6 @@ class _OpenAIPenaltiesLogitsProcessor(LogitsProcessor):
         if (self.presence_penalty == 0.0) and (self.frequency_penalty == 0.0):
             return scores
 
-        # batch support (auch wenn wir typischerweise batch=1 haben)
         batch_size = input_ids.shape[0]
         for b in range(batch_size):
             ids = input_ids[b]
@@ -261,7 +260,6 @@ class HFLLM(BaseLLM):
         )
         self.model.eval()
 
-        # Kontextfenster realistisch begrenzen (HF Modelle haben häufig max_position_embeddings)
         max_pos = getattr(self.model.config, "max_position_embeddings", cfg["n_ctx"])
         self.n_ctx = min(int(cfg["n_ctx"]), int(max_pos))
 
@@ -273,8 +271,7 @@ class HFLLM(BaseLLM):
 
     def _filter_gen_kwargs(self, gen_kwargs: dict) -> dict:
         """
-        Transformers generate() akzeptiert nur bestimmte Keys (über GenerationConfig),
-        plus einige Runtime-Keys. Wir filtern strikt, um ValueError zu vermeiden.
+        Transformers generate() akzeptiert nur bestimmte Keys.
         """
         allowed = set(self.model.generation_config.to_dict().keys())
         runtime_allowed = {
@@ -309,13 +306,12 @@ class HFLLM(BaseLLM):
         device = next(self.model.parameters()).device
         inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
 
-        # Optional: deterministische Sampling-Quelle via Generator
+        # deterministische Sampling-Quelle via Generator
         generator = None
         if seed is not None:
             s = int(seed)
             generator = torch.Generator(device=device)
             generator.manual_seed(s)
-            # zusätzlich global setzen (hilft bei manchen Pfaden)
             torch.manual_seed(s)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(s)
@@ -330,11 +326,10 @@ class HFLLM(BaseLLM):
         # do_sample Logik
         temp = 1.0 if temperature is None else float(temperature)
         do_sample = temp > 0.0
-        # Bei greedy (do_sample=False) spielt temperature keine Rolle; wir lassen temp trotzdem sinnvoll.
         if not do_sample:
             temp = 1.0
 
-        # presence/frequency penalty emulieren via LogitsProcessor
+        # presence/frequency penalty via LogitsProcessor
         logits_processor = None
         pp = 0.0 if presence_penalty is None else float(presence_penalty)
         fp = 0.0 if frequency_penalty is None else float(frequency_penalty)
@@ -348,9 +343,7 @@ class HFLLM(BaseLLM):
             "top_p": 1.0 if top_p is None else float(top_p),
             "top_k": int(top_k) if top_k is not None else None,
             "typical_p": float(typical_p) if typical_p is not None else None,
-            # min_p ist je nach Transformers-Version verfügbar; wir setzen es, filtern aber später.
             "min_p": float(min_p) if min_p is not None else None,
-            # repeat_penalty -> repetition_penalty (Transformers Naming)
             "repetition_penalty": float(repeat_penalty) if repeat_penalty is not None else None,
             "eos_token_id": self.tokenizer.eos_token_id,
             "stopping_criteria": stopping_criteria,
@@ -358,10 +351,7 @@ class HFLLM(BaseLLM):
             "generator": generator,
         }
 
-        # None-Keys entfernen
         gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
-
-        # Unbekannte Keys filtern (z.B. min_p, typical_p falls nicht unterstützt)
         gen_kwargs = self._filter_gen_kwargs(gen_kwargs)
 
         if not stream:
@@ -371,7 +361,6 @@ class HFLLM(BaseLLM):
             gen_tokens = out[0][inputs["input_ids"].shape[-1]:]
             text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True)
 
-            # Stop-Strings ggf. hart abschneiden (saubere Ausgabe)
             if stop:
                 for s in stop:
                     if s and s in text:
@@ -396,8 +385,12 @@ class HFLLM(BaseLLM):
         gen_kwargs_stream = self._filter_gen_kwargs(gen_kwargs_stream)
 
         def _run():
-            with torch.no_grad():
-                self.model.generate(**inputs, **gen_kwargs_stream)
+            try:
+                with torch.no_grad():
+                    self.model.generate(**inputs, **gen_kwargs_stream)
+            except Exception as e:
+                # Fehler im Generierungs-Thread loggen
+                print(f"[HFLLM] Error in generation thread: {type(e).__name__}: {e}", flush=True)
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()
@@ -517,7 +510,6 @@ class ChatCompletionRequest(BaseModel):
 
     # ctx budget pro Request (<= geladenes Model-n_ctx)
     ctx: Optional[int] = None
-    # Aliases, falls du es anders nennen willst
     context_window: Optional[int] = None
     n_ctx: Optional[int] = None
 
@@ -901,6 +893,7 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
                 reserved_new_tokens=reserved,
             )
 
+            # Initiales Chunk mit role
             yield sse({
                 "id": stream_id,
                 "object": "chat.completion.chunk",
@@ -934,7 +927,27 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
                 iterator = llm.create_completion(**kwargs)
             except ValueError as e:
                 if not is_context_error(e):
-                    raise
+                    # Kontextfremder Fehler -> als SSE-Error senden
+                    err_msg = f"{type(e).__name__}: {str(e)}"
+                    yield sse({
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "error",
+                        }],
+                        "error": {
+                            "message": err_msg,
+                            "type": "request_error",
+                        },
+                    })
+                    yield "data: [DONE]\n\n"
+                    return
+
+                # Kontextfehler -> minimaler Kontext
                 minimal = [m for m in body.messages if m.role == "system"]
                 last_user = next(
                     (m for m in reversed(body.messages) if m.role == "user"),
@@ -949,10 +962,20 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
 
             buf = ""
             last_flush = time.monotonic()
-            stopped_early = False
+            last_token_time = time.monotonic()
 
             try:
-                for chunk in iterator:
+                while True:
+                    # Timeout: wenn zu lange keine Tokens kommen
+                    if (time.monotonic() - last_token_time) > STREAM_TIMEOUT_SEC:
+                        raise TimeoutError("no tokens generated within timeout window")
+
+                    try:
+                        chunk = next(iterator)
+                    except StopIteration:
+                        break
+
+                    last_token_time = time.monotonic()
                     choice = chunk["choices"][0]
                     delta = choice.get("text", "")
                     finish_reason = choice.get("finish_reason", None)
@@ -982,7 +1005,6 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
                             last_flush = now_m
 
                     if finish_reason == "stop":
-                        stopped_early = True
                         break
 
                 if buf:
@@ -1012,6 +1034,27 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
                 yield "data: [DONE]\n\n"
 
             except GeneratorExit:
+                # Client hat Verbindung geschlossen
+                return
+            except Exception as e:
+                # Fehler im Streaming – als SSE-Fehler senden
+                err_msg = f"{type(e).__name__}: {str(e)}"
+                yield sse({
+                    "id": stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_id,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "error",
+                    }],
+                    "error": {
+                        "message": err_msg,
+                        "type": "stream_error",
+                    },
+                })
+                yield "data: [DONE]\n\n"
                 return
 
     return event_stream()
