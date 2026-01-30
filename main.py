@@ -1,5 +1,6 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 import time
 import json
 import glob
@@ -8,6 +9,7 @@ import gc
 from uuid import uuid4
 from typing import List, Literal, Optional, Dict, Union, Tuple
 from datetime import date
+from functools import lru_cache
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -25,6 +27,8 @@ from transformers import (
     LogitsProcessor,
     LogitsProcessorList,
 )
+
+from jinja2 import Environment, BaseLoader
 
 # --------------------------------------------------
 # Environment / GPU
@@ -111,6 +115,48 @@ class GGUFLLM(BaseLLM):
             use_mmap=True,
         )
         self.n_ctx = cfg["n_ctx"]
+
+        # --- GGUF meta / chat template (falls vorhanden) ---
+        self.gguf_metadata = self._read_metadata()
+        self.chat_template = self._pick_chat_template(self.gguf_metadata)
+        self.bos_token = self._pick_token(self.gguf_metadata, is_bos=True) or ""
+        self.eos_token = self._pick_token(self.gguf_metadata, is_bos=False) or ""
+
+    def _read_metadata(self) -> Dict[str, str]:
+        meta = {}
+        try:
+            m = getattr(self._llm, "metadata", None)
+            if callable(m):
+                meta = m() or {}
+            elif isinstance(m, dict):
+                meta = m
+        except Exception:
+            meta = {}
+        return meta or {}
+
+    def _pick_chat_template(self, meta: Dict[str, str]) -> Optional[str]:
+        # häufigster Key in GGUF:
+        for k in (
+            "tokenizer.chat_template",
+            "chat_template",
+            "tokenizer.ggml.chat_template",
+        ):
+            v = meta.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        return None
+
+    def _pick_token(self, meta: Dict[str, str], *, is_bos: bool) -> Optional[str]:
+        keys = (
+            ("tokenizer.bos_token", "tokenizer.ggml.bos_token", "bos_token")
+            if is_bos
+            else ("tokenizer.eos_token", "tokenizer.ggml.eos_token", "eos_token")
+        )
+        for k in keys:
+            v = meta.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        return None
 
     def tokenize(self, text: str) -> List[int]:
         b = text.encode("utf-8")
@@ -252,7 +298,6 @@ class HFLLM(BaseLLM):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # device_map="auto" kann Offload machen, aber bei voller GPU trotzdem OOM.
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.float16 if device == "cuda" else torch.float32,
@@ -710,8 +755,55 @@ def render_messages_to_prompt_harmony(messages: List[ChatMessage]) -> str:
     parts.extend(convo)
     return "\n".join(parts)
 
-def render_messages_auto(messages: List[ChatMessage], model_id: str) -> str:
-    return render_messages_to_prompt_harmony(messages) if is_gpt_oss_model(model_id) else render_messages_to_prompt(messages)
+@lru_cache(maxsize=64)
+def _compile_chat_template(template_str: str):
+    env = Environment(
+        loader=BaseLoader(),
+        autoescape=False,
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    return env.from_string(template_str)
+
+def render_messages_to_prompt_gguf(messages: List[ChatMessage], llm: GGUFLLM) -> str:
+    tmpl = getattr(llm, "chat_template", None)
+    if not tmpl:
+        return render_messages_to_prompt(messages)
+
+    j = _compile_chat_template(tmpl)
+
+    msgs = [{"role": m.role, "content": m.content} for m in messages]
+    today = date.today().isoformat()
+    ctx = {
+        "messages": msgs,
+        "bos_token": getattr(llm, "bos_token", "") or "",
+        "eos_token": getattr(llm, "eos_token", "") or "",
+        "add_generation_prompt": True,
+        # häufig erwartete Variablen:
+        "tools": None,
+        "tool_choice": None,
+        "date_string": today,
+        "current_date": today,
+    }
+
+    try:
+        out = j.render(**ctx)
+        return out if isinstance(out, str) else str(out)
+    except Exception:
+        return render_messages_to_prompt(messages)
+
+def render_messages_auto(llm: BaseLLM, messages: List[ChatMessage], model_id: str) -> str:
+    # gpt-oss: Harmony
+    if is_gpt_oss_model(model_id):
+        return render_messages_to_prompt_harmony(messages)
+
+    # GGUF: wenn chat_template eingebettet ist -> nutzen
+    if getattr(llm, "backend", None) == "gguf" and isinstance(llm, GGUFLLM):
+        if getattr(llm, "chat_template", None):
+            return render_messages_to_prompt_gguf(messages, llm)
+
+    # Default: EvaGPT Template
+    return render_messages_to_prompt(messages)
 
 def is_context_error(e: Exception) -> bool:
     msg = str(e)
@@ -795,7 +887,7 @@ def fit_messages_to_context(
     prompt_budget = max(1, n_ctx - reserved_new_tokens - CONTEXT_MARGIN_TOKENS)
 
     if not messages:
-        prompt = render_messages_auto(messages, model_id)
+        prompt = render_messages_auto(llm, messages, model_id)
         prompt_tokens = count_tokens(llm, prompt)
         available = max(0, n_ctx - prompt_tokens - 1)
         return messages, prompt, prompt_tokens, min(reserved_new_tokens, available)
@@ -821,13 +913,13 @@ def fit_messages_to_context(
 
     trimmed_history = history_msgs[:]
     final_msgs = system_msgs + trimmed_history + [prompt_msg]
-    prompt = render_messages_auto(final_msgs, model_id)
+    prompt = render_messages_auto(llm, final_msgs, model_id)
     prompt_tokens = count_tokens(llm, prompt)
 
     while prompt_tokens > prompt_budget and trimmed_history:
         trimmed_history.pop(0)
         final_msgs = system_msgs + trimmed_history + [prompt_msg]
-        prompt = render_messages_auto(final_msgs, model_id)
+        prompt = render_messages_auto(llm, final_msgs, model_id)
         prompt_tokens = count_tokens(llm, prompt)
 
     if prompt_tokens > prompt_budget:
@@ -839,7 +931,7 @@ def fit_messages_to_context(
             content=truncate_text_by_tokens(llm, prompt_msg.content, keep_user, keep_end=True),
         )
         final_msgs = system_msgs + trimmed_history + [prompt_msg]
-        prompt = render_messages_auto(final_msgs, model_id)
+        prompt = render_messages_auto(llm, final_msgs, model_id)
         prompt_tokens = count_tokens(llm, prompt)
 
     if prompt_tokens > prompt_budget and system_msgs:
@@ -850,7 +942,7 @@ def fit_messages_to_context(
         new_system = truncate_text_by_tokens(llm, system_text, keep_sys, keep_end=False)
         system_msgs = [ChatMessage(role="system", content=new_system)]
         final_msgs = system_msgs + trimmed_history + [prompt_msg]
-        prompt = render_messages_auto(final_msgs, model_id)
+        prompt = render_messages_auto(llm, final_msgs, model_id)
         prompt_tokens = count_tokens(llm, prompt)
 
     available_new = max(0, n_ctx - prompt_tokens - 1)
@@ -885,8 +977,6 @@ def build_completion_kwargs(
     }
 
 def non_stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: threading.Lock):
-    # Prompt/Fit kannst du theoretisch außerhalb lock machen – aber da du auf einer Maschine
-    # Ressourcen hart teilst, ist dieser lock ok (und verhindert parallele OOM-Spikes).
     with lock:
         effective_n_ctx = get_effective_n_ctx(llm, body, model_id)
         reserved = _requested_new_tokens(body, effective_n_ctx)
