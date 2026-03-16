@@ -63,9 +63,8 @@ HARMONY_REASONING = os.getenv("HARMONY_REASONING", "medium")
 
 # --------------------------------------------------
 # Speicher-/Load-Policy
-#   MAX_MODELS_IN_MEMORY=1 => immer nur ein Modell gleichzeitig geladen halten
 # --------------------------------------------------
-MAX_MODELS_IN_MEMORY = int(os.getenv("MAX_MODELS_IN_MEMORY", "1"))  # default: 1 => kein OOM beim switch
+MAX_MODELS_IN_MEMORY = int(os.getenv("MAX_MODELS_IN_MEMORY", "1"))
 FORCE_CUDA_CLEANUP_ON_SWITCH = os.getenv("FORCE_CUDA_CLEANUP_ON_SWITCH", "1") == "1"
 
 # --------------------------------------------------
@@ -111,16 +110,19 @@ class GGUFLLM(BaseLLM):
             n_threads=cfg["n_threads"],
             n_gpu_layers=cfg["n_gpu_layers"],
             n_batch=cfg["n_batch"],
-            # Quick win fürs Laden:
             use_mmap=True,
         )
         self.n_ctx = cfg["n_ctx"]
 
-        # --- GGUF meta / chat template (falls vorhanden) ---
         self.gguf_metadata = self._read_metadata()
         self.chat_template = self._pick_chat_template(self.gguf_metadata)
         self.bos_token = self._pick_token(self.gguf_metadata, is_bos=True) or ""
         self.eos_token = self._pick_token(self.gguf_metadata, is_bos=False) or ""
+
+        print(f"[GGUF] model={cfg['path']}", flush=True)
+        print(f"[GGUF] chat_template_found={bool(self.chat_template)}", flush=True)
+        print(f"[GGUF] chat_template_preview={repr((self.chat_template or '')[:200])}", flush=True)
+        print(f"[GGUF] bos_token={repr(self.bos_token)} eos_token={repr(self.eos_token)}", flush=True)
 
     def _read_metadata(self) -> Dict[str, str]:
         meta = {}
@@ -135,7 +137,6 @@ class GGUFLLM(BaseLLM):
         return meta or {}
 
     def _pick_chat_template(self, meta: Dict[str, str]) -> Optional[str]:
-        # häufigster Key in GGUF:
         for k in (
             "tokenizer.chat_template",
             "chat_template",
@@ -468,7 +469,6 @@ MODEL_CACHE: Dict[str, BaseLLM] = {}
 MODEL_LOCKS: Dict[str, threading.Lock] = {}
 MODEL_LOCKS_GLOBAL_LOCK = threading.Lock()
 
-# Ganz wichtig: verhindert paralleles Laden/Entladen
 GLOBAL_MODEL_LOAD_LOCK = threading.Lock()
 ACTIVE_MODEL_ID: Optional[str] = None
 
@@ -493,7 +493,6 @@ def _cuda_cleanup():
 
 
 def unload_model(model_id: str):
-    """Entlädt ein Modell aus dem Cache + versucht VRAM/RAM freizugeben."""
     global MODEL_CACHE
     if model_id not in MODEL_CACHE:
         return
@@ -501,7 +500,6 @@ def unload_model(model_id: str):
     obj = MODEL_CACHE.pop(model_id, None)
 
     try:
-        # HF: erst auf CPU schieben, dann löschen
         if getattr(obj, "backend", None) == "hf" and hasattr(obj, "model"):
             try:
                 obj.model.to("cpu")
@@ -510,7 +508,6 @@ def unload_model(model_id: str):
     except Exception:
         pass
 
-    # Hard delete
     del obj
     gc.collect()
     if FORCE_CUDA_CLEANUP_ON_SWITCH:
@@ -518,11 +515,6 @@ def unload_model(model_id: str):
 
 
 def get_llama(model_id: Optional[str]) -> BaseLLM:
-    """
-    Thread-safe:
-    - Nie paralleles Laden/Entladen (GLOBAL_MODEL_LOAD_LOCK)
-    - Optional: Nur ein Modell gleichzeitig im Speicher (MAX_MODELS_IN_MEMORY=1)
-    """
     global ACTIVE_MODEL_ID
 
     if model_id is None:
@@ -531,13 +523,11 @@ def get_llama(model_id: Optional[str]) -> BaseLLM:
         raise KeyError(model_id)
 
     with GLOBAL_MODEL_LOAD_LOCK:
-        # Wenn nur 1 Modell im Speicher erlaubt ist: altes Modell vor dem Laden entladen
         if MAX_MODELS_IN_MEMORY <= 1:
             if ACTIVE_MODEL_ID is not None and ACTIVE_MODEL_ID != model_id:
                 if ACTIVE_MODEL_ID in MODEL_CACHE:
                     unload_model(ACTIVE_MODEL_ID)
 
-        # Jetzt laden (falls nicht da)
         if model_id not in MODEL_CACHE:
             cfg = MODEL_CONFIGS[model_id]
             if cfg["backend"] == "gguf":
@@ -555,6 +545,7 @@ def get_llama(model_id: Optional[str]) -> BaseLLM:
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
+
 
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = None
@@ -578,19 +569,23 @@ class ChatCompletionRequest(BaseModel):
     repeat_penalty: Optional[float] = None
     seed: Optional[int] = None
 
+
 class ChatCompletionResponseChoiceMessage(BaseModel):
     role: Literal["assistant"]
     content: str
+
 
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatCompletionResponseChoiceMessage
     finish_reason: Optional[str] = "stop"
 
+
 class ChatCompletionUsage(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+
 
 class ChatCompletionResponse(BaseModel):
     id: str
@@ -605,6 +600,7 @@ class ChatCompletionResponse(BaseModel):
 # FastAPI-App
 # --------------------------------------------------
 app = FastAPI(title="GGUF+HF OpenAI-like API")
+
 
 @app.get("/v1/models")
 def list_models():
@@ -622,6 +618,7 @@ def list_models():
         ],
     }
 
+
 @app.get("/health")
 def health():
     return {
@@ -631,6 +628,7 @@ def health():
         "max_models_in_memory": MAX_MODELS_IN_MEMORY,
         "active_model": ACTIVE_MODEL_ID,
     }
+
 
 @app.post("/v1/chat/completions")
 def chat_completions(body: ChatCompletionRequest):
@@ -662,13 +660,23 @@ def chat_completions(body: ChatCompletionRequest):
 
 
 # --------------------------------------------------
-# Prompt-Helfer (EvaGPT + Harmony für gpt-oss)
+# Prompt-Helfer
 # --------------------------------------------------
 def is_gpt_oss_model(model_id: Optional[str]) -> bool:
     return bool(model_id) and ("gpt-oss" in model_id.lower())
 
+
+def should_skip_gguf_template(model_id: Optional[str]) -> bool:
+    mid = (model_id or "").lower()
+
+    blocked_models = {
+        "evagpt-german-x-llamatok-de-7b-f16",
+    }
+
+    return mid in blocked_models
+
+
 def render_messages_to_prompt(messages: List[ChatMessage]) -> str:
-    # EvaGPT / dein bisheriges Template
     if not messages:
         return "<|System|>\n</s>\n<|Benutzer|>\n</s>\n<|Assistentin|>"
 
@@ -715,11 +723,12 @@ def render_messages_to_prompt(messages: List[ChatMessage]) -> str:
     parts.append("<|Assistentin|>")
     return "\n".join(parts)
 
+
 def render_messages_to_prompt_harmony(messages: List[ChatMessage]) -> str:
     current_date = date.today().isoformat()
     system_block = (
         "<|start|>system<|message|>"
-        "You are ChatGPT, a large language model trained by OpenAI.\n"
+        "You are EvaGPT, a large language model trained by TMP-Networks.\n"
         f"Knowledge cutoff: {HARMONY_KNOWLEDGE_CUTOFF}\n"
         f"Current date: {current_date}\n\n"
         f"Reasoning: {HARMONY_REASONING}\n\n"
@@ -755,6 +764,7 @@ def render_messages_to_prompt_harmony(messages: List[ChatMessage]) -> str:
     parts.extend(convo)
     return "\n".join(parts)
 
+
 @lru_cache(maxsize=64)
 def _compile_chat_template(template_str: str):
     env = Environment(
@@ -765,7 +775,12 @@ def _compile_chat_template(template_str: str):
     )
     return env.from_string(template_str)
 
-def render_messages_to_prompt_gguf(messages: List[ChatMessage], llm: GGUFLLM) -> str:
+
+def render_messages_to_prompt_gguf(
+    messages: List[ChatMessage],
+    llm: GGUFLLM,
+    model_id: Optional[str] = None,
+) -> str:
     tmpl = getattr(llm, "chat_template", None)
     if not tmpl:
         return render_messages_to_prompt(messages)
@@ -773,37 +788,54 @@ def render_messages_to_prompt_gguf(messages: List[ChatMessage], llm: GGUFLLM) ->
     j = _compile_chat_template(tmpl)
 
     msgs = [{"role": m.role, "content": m.content} for m in messages]
-    today = date.today().isoformat()
+    today = date.today()
+
+    def strftime_now(fmt: str) -> str:
+        return time.strftime(fmt)
+
+    def raise_exception(msg: str):
+        raise RuntimeError(msg)
+
     ctx = {
         "messages": msgs,
         "bos_token": getattr(llm, "bos_token", "") or "",
         "eos_token": getattr(llm, "eos_token", "") or "",
         "add_generation_prompt": True,
-        # häufig erwartete Variablen:
+
         "tools": None,
         "tool_choice": None,
-        "date_string": today,
-        "current_date": today,
+        "builtin_tools": [],
+        "model_identity": model_id or "",
+        "model_id": model_id or "",
+        "date_string": today.isoformat(),
+        "current_date": today.isoformat(),
+
+        "strftime_now": strftime_now,
+        "raise_exception": raise_exception,
     }
 
     try:
         out = j.render(**ctx)
         return out if isinstance(out, str) else str(out)
-    except Exception:
+    except Exception as e:
+        print(f"[GGUF TEMPLATE] render failed: {type(e).__name__}: {e}", flush=True)
+        if is_gpt_oss_model(model_id):
+            return render_messages_to_prompt_harmony(messages)
         return render_messages_to_prompt(messages)
 
+
 def render_messages_auto(llm: BaseLLM, messages: List[ChatMessage], model_id: str) -> str:
-    # gpt-oss: Harmony
     if is_gpt_oss_model(model_id):
         return render_messages_to_prompt_harmony(messages)
 
-    # GGUF: wenn chat_template eingebettet ist -> nutzen
-    if getattr(llm, "backend", None) == "gguf" and isinstance(llm, GGUFLLM):
-        if getattr(llm, "chat_template", None):
-            return render_messages_to_prompt_gguf(messages, llm)
+    if should_skip_gguf_template(model_id):
+        return render_messages_to_prompt(messages)
 
-    # Default: EvaGPT Template
+    if isinstance(llm, GGUFLLM) and getattr(llm, "chat_template", None):
+        return render_messages_to_prompt_gguf(messages, llm, model_id)
+
     return render_messages_to_prompt(messages)
+
 
 def is_context_error(e: Exception) -> bool:
     msg = str(e)
@@ -816,11 +848,14 @@ def is_context_error(e: Exception) -> bool:
 def _tokenize(llm: BaseLLM, text: str) -> List[int]:
     return llm.tokenize(text)
 
+
 def _detokenize(llm: BaseLLM, tokens: List[int]) -> str:
     return llm.detokenize(tokens)
 
+
 def count_tokens(llm: BaseLLM, text: str) -> int:
     return len(_tokenize(llm, text))
+
 
 def truncate_text_by_tokens(llm: BaseLLM, text: str, max_tokens: int, keep_end: bool) -> str:
     if max_tokens <= 0:
@@ -831,6 +866,7 @@ def truncate_text_by_tokens(llm: BaseLLM, text: str, max_tokens: int, keep_end: 
     toks = toks[-max_tokens:] if keep_end else toks[:max_tokens]
     return _detokenize(llm, toks)
 
+
 def _normalize_stop(stop: Optional[Union[str, List[str]]]) -> Optional[List[str]]:
     if stop is None:
         return None
@@ -838,6 +874,7 @@ def _normalize_stop(stop: Optional[Union[str, List[str]]]) -> Optional[List[str]
         return [stop]
     stop = [s for s in stop if s]
     return stop or None
+
 
 def normalize_stop_for_model(stop: Optional[Union[str, List[str]]], model_id: str) -> Optional[List[str]]:
     s = _normalize_stop(stop)
@@ -867,6 +904,7 @@ def get_effective_n_ctx(llm: BaseLLM, body: ChatCompletionRequest, model_id: str
         return base
     return max(512, min(requested, base))
 
+
 def _requested_new_tokens(body: ChatCompletionRequest, n_ctx: int) -> int:
     req = body.max_tokens if body.max_tokens is not None else DEFAULT_MAX_NEW_TOKENS
     try:
@@ -876,6 +914,7 @@ def _requested_new_tokens(body: ChatCompletionRequest, n_ctx: int) -> int:
     req = max(0, req)
     max_reasonable = max(0, n_ctx - CONTEXT_MARGIN_TOKENS - MIN_PROMPT_BUDGET_TOKENS)
     return min(req, max_reasonable)
+
 
 def fit_messages_to_context(
     llm: BaseLLM,
@@ -976,6 +1015,7 @@ def build_completion_kwargs(
         "stop": normalize_stop_for_model(body.stop, model_id),
     }
 
+
 def non_stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: threading.Lock):
     with lock:
         effective_n_ctx = get_effective_n_ctx(llm, body, model_id)
@@ -989,12 +1029,29 @@ def non_stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lo
             model_id=model_id,
         )
 
+        print(
+            {
+                "model_id": model_id,
+                "backend": getattr(llm, "backend", None),
+                "gguf_template": bool(getattr(llm, "chat_template", None)) if isinstance(llm, GGUFLLM) else False,
+                "skip_gguf_template": should_skip_gguf_template(model_id),
+                "effective_n_ctx": effective_n_ctx,
+                "prompt_tokens": prompt_tokens,
+                "reserved": reserved,
+                "max_new": max_new,
+            },
+            flush=True,
+        )
+        print(f"[PROMPT PREVIEW] {repr(prompt[:800])}", flush=True)
+
         if max_new <= 0:
             text = ""
             finish_reason = "stop"
             completion_tokens = 0
         else:
             kwargs = build_completion_kwargs(body, prompt, stream=False, max_tokens=max_new, model_id=model_id)
+            print(f"[STOP SEQS] {kwargs.get('stop')}", flush=True)
+
             try:
                 result = llm.create_completion(**kwargs)
             except ValueError as e:
@@ -1013,6 +1070,15 @@ def non_stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lo
             text = choice.get("text", "")
             finish_reason = choice.get("finish_reason", "stop")
             completion_tokens = len(_tokenize(llm, text))
+
+            print(
+                {
+                    "finish_reason": finish_reason,
+                    "text_preview": repr(text[:200]),
+                    "text_len": len(text),
+                },
+                flush=True,
+            )
 
             if is_gpt_oss_model(model_id):
                 text = text.replace("<|end|>", "").strip()
@@ -1038,6 +1104,7 @@ def non_stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lo
     )
     return response.model_dump()
 
+
 def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: threading.Lock):
     def sse(data: dict) -> str:
         return "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
@@ -1057,6 +1124,20 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
                 reserved_new_tokens=reserved,
                 model_id=model_id,
             )
+
+            print(
+                {
+                    "model_id": model_id,
+                    "backend": getattr(llm, "backend", None),
+                    "gguf_template": bool(getattr(llm, "chat_template", None)) if isinstance(llm, GGUFLLM) else False,
+                    "skip_gguf_template": should_skip_gguf_template(model_id),
+                    "effective_n_ctx": effective_n_ctx,
+                    "reserved": reserved,
+                    "max_new": max_new,
+                },
+                flush=True,
+            )
+            print(f"[PROMPT PREVIEW] {repr(prompt[:800])}", flush=True)
 
             yield sse({
                 "id": stream_id,
@@ -1078,6 +1159,7 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
                 return
 
             kwargs = build_completion_kwargs(body, prompt, stream=True, max_tokens=max_new, model_id=model_id)
+            print(f"[STOP SEQS] {kwargs.get('stop')}", flush=True)
 
             try:
                 iterator = llm.create_completion(**kwargs)
