@@ -58,6 +58,13 @@ STREAM_FLUSH_INTERVAL_SEC = float(os.getenv("LLAMA_STREAM_FLUSH_INTERVAL_SEC", "
 STREAM_TIMEOUT_SEC = float(os.getenv("LLAMA_STREAM_TIMEOUT_SEC", "60.0"))
 
 # --------------------------------------------------
+# Retry / Empty-Response-Handling
+# --------------------------------------------------
+EMPTY_RESPONSE_RETRIES = int(os.getenv("EMPTY_RESPONSE_RETRIES", "1"))
+EMPTY_RESPONSE_MIN_CHARS = int(os.getenv("EMPTY_RESPONSE_MIN_CHARS", "1"))
+RETRY_BACKOFF_SEC = float(os.getenv("RETRY_BACKOFF_SEC", "0.15"))
+
+# --------------------------------------------------
 # gpt-oss / Harmony Settings (ENV optional)
 # --------------------------------------------------
 HARMONY_KNOWLEDGE_CUTOFF = os.getenv("HARMONY_KNOWLEDGE_CUTOFF", "2024-06")
@@ -318,7 +325,6 @@ def render_messages_to_prompt_hf(messages: List["ChatMessage"], hf_llm: "HFLLM")
         except Exception as e:
             print(f"[HF] apply_chat_template failed -> fallback: {type(e).__name__}: {e}", flush=True)
 
-    # plain fallback
     system = "\n".join([m.content for m in messages if m.role == "system"]).strip()
     convo = []
     for m in messages:
@@ -403,7 +409,6 @@ class HFLLM(BaseLLM):
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(s)
 
-        # OpenWebUI default stop can kill HF output; ignore it
         if stop == ["</s>"]:
             stop = None
 
@@ -438,13 +443,11 @@ class HFLLM(BaseLLM):
             "logits_processor": logits_processor,
             "generator": generator,
 
-            # HARD FIX for streaming: streamer supports only batch size 1
             "num_beams": 1,
             "num_return_sequences": 1,
         }
         gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
         gen_kwargs = self._filter_gen_kwargs(gen_kwargs)
-
 
         if not stream:
             with torch.no_grad():
@@ -453,13 +456,14 @@ class HFLLM(BaseLLM):
             text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True)
             return {"choices": [{"text": text, "finish_reason": "stop"}]}
 
-        # Queue-based streaming: robust for OpenWebUI
         q: "queue.Queue[Union[str, Exception, None]]" = queue.Queue()
         streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
 
         gen_kwargs_stream = dict(gen_kwargs)
         gen_kwargs_stream["streamer"] = streamer
         gen_kwargs_stream = self._filter_gen_kwargs(gen_kwargs_stream)
+
+        done_evt = threading.Event()
 
         def _run_generate():
             try:
@@ -468,7 +472,7 @@ class HFLLM(BaseLLM):
             except Exception as e:
                 q.put(e)
             finally:
-                q.put(None)  # end marker
+                done_evt.set()
 
         def _run_streamer_to_queue():
             try:
@@ -477,6 +481,9 @@ class HFLLM(BaseLLM):
                         q.put(piece)
             except Exception as e:
                 q.put(e)
+            finally:
+                done_evt.wait(timeout=5.0)
+                q.put(None)
 
         threading.Thread(target=_run_generate, daemon=True).start()
         threading.Thread(target=_run_streamer_to_queue, daemon=True).start()
@@ -703,12 +710,14 @@ def chat_completions(body: ChatCompletionRequest):
 def is_gpt_oss_model(model_id: Optional[str]) -> bool:
     return bool(model_id) and ("gpt-oss" in model_id.lower())
 
+
 def should_skip_gguf_template(model_id: Optional[str]) -> bool:
     mid = (model_id or "").lower()
     blocked_models = {
         "evagpt-german-x-llamatok-de-7b-f16",
     }
     return mid in blocked_models
+
 
 def render_messages_to_prompt_harmony(messages: List[ChatMessage]) -> str:
     current_date = date.today().isoformat()
@@ -744,10 +753,12 @@ def render_messages_to_prompt_harmony(messages: List[ChatMessage]) -> str:
     parts.extend(convo)
     return "\n".join(parts)
 
+
 @lru_cache(maxsize=64)
 def _compile_chat_template(template_str: str):
     env = Environment(loader=BaseLoader(), autoescape=False, trim_blocks=True, lstrip_blocks=True)
     return env.from_string(template_str)
+
 
 def render_messages_to_prompt(messages: List[ChatMessage]) -> str:
     if not messages:
@@ -796,10 +807,10 @@ def render_messages_to_prompt(messages: List[ChatMessage]) -> str:
     parts.append("<|Assistentin|>")
     return "\n".join(parts)
 
+
 def render_messages_to_prompt_gguf(messages: List[ChatMessage], llm: GGUFLLM, model_id: Optional[str] = None) -> str:
     tmpl = getattr(llm, "chat_template", None)
     if not tmpl:
-        # fallback
         return "\n".join([m.content for m in messages if m.content]).strip()
 
     j = _compile_chat_template(tmpl)
@@ -835,6 +846,7 @@ def render_messages_to_prompt_gguf(messages: List[ChatMessage], llm: GGUFLLM, mo
         print(f"[GGUF TEMPLATE] render failed: {type(e).__name__}: {e}", flush=True)
         return "\n".join([m.content for m in messages if m.content]).strip()
 
+
 def render_messages_auto(llm: BaseLLM, messages: List[ChatMessage], model_id: str) -> str:
     if is_gpt_oss_model(model_id):
         return render_messages_to_prompt_harmony(messages)
@@ -843,14 +855,12 @@ def render_messages_auto(llm: BaseLLM, messages: List[ChatMessage], model_id: st
         return render_messages_to_prompt_hf(messages, llm)  # type: ignore[arg-type]
 
     if should_skip_gguf_template(model_id):
-        # HIER: explizit dein Template!
         return render_messages_to_prompt(messages)
 
     if isinstance(llm, GGUFLLM) and getattr(llm, "chat_template", None):
         return render_messages_to_prompt_gguf(messages, llm, model_id)
 
     return "\n".join([m.content for m in messages if m.content]).strip()
-
 
 
 # --------------------------------------------------
@@ -867,7 +877,6 @@ def _normalize_stop(stop: Optional[Union[str, List[str]]]) -> Optional[List[str]
 
 def normalize_stop_for_model(stop: Optional[Union[str, List[str]]], model_id: str) -> Optional[List[str]]:
     s = _normalize_stop(stop)
-    # OpenWebUI default stop often breaks HF streaming; ignore it
     if s == ["</s>"]:
         return None
     if is_gpt_oss_model(model_id):
@@ -1009,6 +1018,102 @@ def build_completion_kwargs(body: ChatCompletionRequest, prompt: str, stream: bo
 
 
 # --------------------------------------------------
+# Retry-Helfer
+# --------------------------------------------------
+def _is_effectively_empty_text(text: Optional[str]) -> bool:
+    if text is None:
+        return True
+    return len(text.strip()) < EMPTY_RESPONSE_MIN_CHARS
+
+
+def _build_retry_kwargs(kwargs: dict, attempt: int) -> dict:
+    retry_kwargs = dict(kwargs)
+
+    if retry_kwargs.get("seed") is not None:
+        retry_kwargs["seed"] = int(retry_kwargs["seed"]) + attempt
+
+    retry_kwargs["max_tokens"] = max(int(retry_kwargs.get("max_tokens", 0)), 64)
+    return retry_kwargs
+
+
+def create_completion_with_empty_retry(llm: BaseLLM, kwargs: dict):
+    last_result = None
+
+    for attempt in range(EMPTY_RESPONSE_RETRIES + 1):
+        current_kwargs = _build_retry_kwargs(kwargs, attempt)
+        result = llm.create_completion(**current_kwargs)
+        last_result = result
+
+        try:
+            choice = result["choices"][0]
+            text = choice.get("text", "")
+        except Exception:
+            text = ""
+
+        if not _is_effectively_empty_text(text):
+            if attempt > 0:
+                print(f"[RETRY SUCCESS] non-stream attempt={attempt}", flush=True)
+            return result
+
+        print(f"[EMPTY RESPONSE] non-stream attempt={attempt}", flush=True)
+
+        if attempt < EMPTY_RESPONSE_RETRIES:
+            time.sleep(RETRY_BACKOFF_SEC)
+
+    return last_result
+
+
+def _streaming_iterator_with_empty_retry(llm: BaseLLM, kwargs: dict):
+    last_iterator = None
+
+    for attempt in range(EMPTY_RESPONSE_RETRIES + 1):
+        current_kwargs = _build_retry_kwargs(kwargs, attempt)
+        iterator = llm.create_completion(**current_kwargs)
+        last_iterator = iterator
+
+        first_chunks = []
+        got_content = False
+
+        try:
+            for _ in range(8):
+                chunk = next(iterator)
+                first_chunks.append(chunk)
+
+                choice = chunk["choices"][0]
+                delta = choice.get("text", "")
+                finish_reason = choice.get("finish_reason", None)
+
+                if delta and not _is_effectively_empty_text(delta):
+                    got_content = True
+                    break
+
+                if finish_reason == "stop":
+                    break
+
+        except StopIteration:
+            pass
+
+        if got_content:
+            if attempt > 0:
+                print(f"[RETRY SUCCESS] stream attempt={attempt}", flush=True)
+
+            def chained():
+                for c in first_chunks:
+                    yield c
+                for c in iterator:
+                    yield c
+
+            return chained()
+
+        print(f"[EMPTY RESPONSE] stream attempt={attempt}", flush=True)
+
+        if attempt < EMPTY_RESPONSE_RETRIES:
+            time.sleep(RETRY_BACKOFF_SEC)
+
+    return last_iterator
+
+
+# --------------------------------------------------
 # API Implementierung
 # --------------------------------------------------
 def non_stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: threading.Lock):
@@ -1016,18 +1121,30 @@ def non_stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lo
         effective_n_ctx = get_effective_n_ctx(llm, body, model_id)
         reserved = _requested_new_tokens(body, effective_n_ctx)
 
-        _final_msgs, prompt, prompt_tokens, max_new = fit_messages_to_context(llm, effective_n_ctx, body.messages, reserved, model_id)
+        _final_msgs, prompt, prompt_tokens, max_new = fit_messages_to_context(
+            llm, effective_n_ctx, body.messages, reserved, model_id
+        )
 
-        print({"model_id": model_id, "backend": getattr(llm, "backend", None), "effective_n_ctx": effective_n_ctx, "reserved": reserved, "max_new": max_new}, flush=True)
+        print({
+            "model_id": model_id,
+            "backend": getattr(llm, "backend", None),
+            "effective_n_ctx": effective_n_ctx,
+            "reserved": reserved,
+            "max_new": max_new
+        }, flush=True)
         print(f"[PROMPT PREVIEW] {repr(prompt[:800])}", flush=True)
 
         kwargs = build_completion_kwargs(body, prompt, stream=False, max_tokens=max_new, model_id=model_id)
         print(f"[STOP SEQS] {kwargs.get('stop')}", flush=True)
 
-        result = llm.create_completion(**kwargs)
+        result = create_completion_with_empty_retry(llm, kwargs)
         choice = result["choices"][0]
         text = choice.get("text", "")
         finish_reason = choice.get("finish_reason", "stop")
+
+        if _is_effectively_empty_text(text):
+            print("[EMPTY RESPONSE] non-stream final result still empty", flush=True)
+
         completion_tokens = len(_tokenize(llm, text))
 
     now = int(time.time())
@@ -1036,8 +1153,18 @@ def non_stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lo
         object="chat.completion",
         created=now,
         model=model_id,
-        choices=[ChatCompletionResponseChoice(index=0, message=ChatCompletionResponseChoiceMessage(role="assistant", content=text), finish_reason=finish_reason)],
-        usage=ChatCompletionUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=prompt_tokens + completion_tokens),
+        choices=[
+            ChatCompletionResponseChoice(
+                index=0,
+                message=ChatCompletionResponseChoiceMessage(role="assistant", content=text),
+                finish_reason=finish_reason
+            )
+        ],
+        usage=ChatCompletionUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens
+        ),
     )
     return response.model_dump()
 
@@ -1054,18 +1181,30 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
             effective_n_ctx = get_effective_n_ctx(llm, body, model_id)
             reserved = _requested_new_tokens(body, effective_n_ctx)
 
-            _final_msgs, prompt, _prompt_tokens, max_new = fit_messages_to_context(llm, effective_n_ctx, body.messages, reserved, model_id)
+            _final_msgs, prompt, _prompt_tokens, max_new = fit_messages_to_context(
+                llm, effective_n_ctx, body.messages, reserved, model_id
+            )
 
-            print({"model_id": model_id, "backend": getattr(llm, "backend", None), "effective_n_ctx": effective_n_ctx, "reserved": reserved, "max_new": max_new}, flush=True)
+            print({
+                "model_id": model_id,
+                "backend": getattr(llm, "backend", None),
+                "effective_n_ctx": effective_n_ctx,
+                "reserved": reserved,
+                "max_new": max_new
+            }, flush=True)
             print(f"[PROMPT PREVIEW] {repr(prompt[:800])}", flush=True)
 
-            # OpenAI-compatible first chunk (role)
-            yield sse({"id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
-                       "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+            yield sse({
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_id,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
+            })
 
             kwargs = build_completion_kwargs(body, prompt, stream=True, max_tokens=max_new, model_id=model_id)
             print(f"[STOP SEQS] {kwargs.get('stop')}", flush=True)
-            iterator = llm.create_completion(**kwargs)
+            iterator = _streaming_iterator_with_empty_retry(llm, kwargs)
 
         buf = ""
         last_flush = time.monotonic()
@@ -1092,10 +1231,14 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
 
                 now_m = time.monotonic()
 
-                # flush first content immediately
                 if buf and not sent_any:
-                    yield sse({"id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
-                               "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]})
+                    yield sse({
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]
+                    })
                     buf = ""
                     last_flush = now_m
                     sent_any = True
@@ -1105,31 +1248,54 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
 
                 if (len(buf) >= STREAM_BUFFER_CHARS) or ("\n" in buf) or ((now_m - last_flush) >= STREAM_FLUSH_INTERVAL_SEC):
                     if buf:
-                        yield sse({"id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
-                                   "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]})
+                        yield sse({
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]
+                        })
                         buf = ""
                         last_flush = now_m
+                        sent_any = True
 
                 if finish_reason == "stop":
                     break
 
             if buf:
-                yield sse({"id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
-                           "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]})
+                yield sse({
+                    "id": stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_id,
+                    "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]
+                })
+                sent_any = True
 
-            # final chunk + DONE
-            yield sse({"id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
-                       "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+            if not sent_any and not buf:
+                print("[EMPTY RESPONSE] stream finished without content", flush=True)
+
+            yield sse({
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_id,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            })
             yield "data: [DONE]\n\n"
 
         except GeneratorExit:
             return
         except Exception as e:
-            # OpenWebUI often ignores custom error payloads; still send stop + DONE
             err_msg = f"{type(e).__name__}: {str(e)}"
             print(f"[STREAM ERROR] {err_msg}", flush=True)
-            yield sse({"id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model_id,
-                       "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+            yield sse({
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_id,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            })
             yield "data: [DONE]\n\n"
 
     return event_stream()
