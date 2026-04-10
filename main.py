@@ -49,7 +49,7 @@ N_THREADS = int(os.getenv("LLAMA_N_THREADS", str(os.cpu_count() or 4)))
 N_GPU_LAYERS = int(os.getenv("LLAMA_N_GPU_LAYERS", "-1"))
 N_BATCH = int(os.getenv("LLAMA_N_BATCH", "512"))
 
-DEFAULT_MAX_NEW_TOKENS = int(os.getenv("LLAMA_DEFAULT_MAX_TOKENS", "1024"))
+DEFAULT_MAX_NEW_TOKENS = int(os.getenv("LLAMA_DEFAULT_MAX_TOKENS", "4096"))
 CONTEXT_MARGIN_TOKENS = int(os.getenv("LLAMA_CONTEXT_MARGIN_TOKENS", "64"))
 MIN_PROMPT_BUDGET_TOKENS = int(os.getenv("LLAMA_MIN_PROMPT_BUDGET_TOKENS", "256"))
 
@@ -61,7 +61,7 @@ STREAM_TIMEOUT_SEC = float(os.getenv("LLAMA_STREAM_TIMEOUT_SEC", "60.0"))
 # Retry / Empty-Response-Handling
 # --------------------------------------------------
 EMPTY_RESPONSE_RETRIES = int(os.getenv("EMPTY_RESPONSE_RETRIES", "1"))
-EMPTY_RESPONSE_MIN_CHARS = int(os.getenv("EMPTY_RESPONSE_MIN_CHARS", "1"))
+EMPTY_RESPONSE_MIN_CHARS = int(os.getenv("EMPTY_RESPONSE_MIN_CHARS", "3"))
 RETRY_BACKOFF_SEC = float(os.getenv("RETRY_BACKOFF_SEC", "0.15"))
 
 # --------------------------------------------------
@@ -442,7 +442,6 @@ class HFLLM(BaseLLM):
             "stopping_criteria": stopping_criteria,
             "logits_processor": logits_processor,
             "generator": generator,
-
             "num_beams": 1,
             "num_return_sequences": 1,
         }
@@ -711,12 +710,12 @@ def is_gpt_oss_model(model_id: Optional[str]) -> bool:
     return bool(model_id) and ("gpt-oss" in model_id.lower())
 
 
-def should_skip_gguf_template(model_id: Optional[str]) -> bool:
+def should_use_evagpt_prompt(model_id: Optional[str]) -> bool:
     mid = (model_id or "").lower()
-    blocked_models = {
+    forced_models = {
         "evagpt-german-x-llamatok-de-7b-f16",
     }
-    return mid in blocked_models
+    return mid in forced_models
 
 
 def render_messages_to_prompt_harmony(messages: List[ChatMessage]) -> str:
@@ -761,51 +760,66 @@ def _compile_chat_template(template_str: str):
 
 
 def render_messages_to_prompt(messages: List[ChatMessage]) -> str:
+    """
+    EvaGPT Turn-Format:
+
+    <|System|>
+    {system}</s>
+
+    <|Benutzer|>
+    ...
+    </s>
+
+    <|Assistentin|>
+    ...
+    </s>
+
+    <|Benutzer|>
+    ...
+    </s>
+
+    <|Assistentin|>
+    """
     if not messages:
-        return "<|System|>\n</s>\n<|Benutzer|>\n</s>\n<|Assistentin|>"
+        return "<|System|>\n\n</s>\n\n<|Benutzer|>\n\n</s>\n\n<|Assistentin|>"
 
-    system_parts = [m.content for m in messages if m.role == "system"]
-    system_text = "\n".join(system_parts).strip()
+    system_parts = [m.content for m in messages if m.role == "system" and (m.content or "").strip()]
+    system_text = "\n\n".join(system_parts).strip()
 
-    last_user_idx: Optional[int] = None
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].role == "user":
-            last_user_idx = i
-            break
-    if last_user_idx is None:
-        last_user_idx = len(messages) - 1
+    convo_parts: List[str] = []
+    non_system_msgs = [m for m in messages if m.role != "system"]
 
-    prompt_msg = messages[last_user_idx].content
+    for m in non_system_msgs:
+        content = (m.content or "").strip()
+        if not content:
+            continue
 
-    history_msgs: List[ChatMessage] = [
-        m for i, m in enumerate(messages)
-        if i < last_user_idx and m.role != "system"
+        if m.role == "user":
+            convo_parts.append("<|Benutzer|>")
+            convo_parts.append(content)
+            convo_parts.append("</s>")
+        elif m.role == "assistant":
+            convo_parts.append("<|Assistentin|>")
+            convo_parts.append(content)
+            convo_parts.append("</s>")
+
+    if not non_system_msgs or non_system_msgs[-1].role != "user":
+        convo_parts.append("<|Benutzer|>")
+        convo_parts.append("")
+        convo_parts.append("</s>")
+
+    prompt_parts: List[str] = [
+        "<|System|>",
+        system_text,
+        "</s>",
     ]
 
-    history_lines: List[str] = []
-    for m in history_msgs:
-        if m.role == "user":
-            history_lines.append("<|Benutzer|>")
-            history_lines.append(m.content)
-            history_lines.append("</s>")
-        elif m.role == "assistant":
-            history_lines.append("<|Assistentin|>")
-            history_lines.append(m.content)
-            history_lines.append("</s>")
+    if convo_parts:
+        prompt_parts.append("\n\n".join(convo_parts))
 
-    history_text = "\n".join(history_lines) + "\n" if history_lines else ""
+    prompt_parts.append("<|Assistentin|>")
 
-    parts: List[str] = []
-    parts.append("<|System|>")
-    parts.append(system_text)
-    parts.append("</s>")
-    if history_text:
-        parts.append(history_text.rstrip("\n"))
-    parts.append("<|Benutzer|>")
-    parts.append(prompt_msg)
-    parts.append("</s>")
-    parts.append("<|Assistentin|>")
-    return "\n".join(parts)
+    return "\n\n".join(prompt_parts)
 
 
 def render_messages_to_prompt_gguf(messages: List[ChatMessage], llm: GGUFLLM, model_id: Optional[str] = None) -> str:
@@ -851,11 +865,11 @@ def render_messages_auto(llm: BaseLLM, messages: List[ChatMessage], model_id: st
     if is_gpt_oss_model(model_id):
         return render_messages_to_prompt_harmony(messages)
 
+    if should_use_evagpt_prompt(model_id):
+        return render_messages_to_prompt(messages)
+
     if getattr(llm, "backend", None) == "hf":
         return render_messages_to_prompt_hf(messages, llm)  # type: ignore[arg-type]
-
-    if should_skip_gguf_template(model_id):
-        return render_messages_to_prompt(messages)
 
     if isinstance(llm, GGUFLLM) and getattr(llm, "chat_template", None):
         return render_messages_to_prompt_gguf(messages, llm, model_id)
@@ -1026,21 +1040,61 @@ def _is_effectively_empty_text(text: Optional[str]) -> bool:
     return len(text.strip()) < EMPTY_RESPONSE_MIN_CHARS
 
 
-def _build_retry_kwargs(kwargs: dict, attempt: int) -> dict:
+def _inject_empty_response_retry_prompt(prompt: str, model_id: str, attempt: int) -> str:
+    """
+    Gibt dem Modell bei leerer Antwort einen zweiten, klareren Anlauf.
+    """
+    if attempt <= 0:
+        return prompt
+
+    if should_use_evagpt_prompt(model_id):
+        retry_note = (
+            "\n\n"
+            "<|System|>\n"
+            "Du hast noch keine Antwort gegeben. "
+            "Beantworte jetzt direkt die letzte Benutzeranfrage inhaltlich und vollständig."
+            "\n</s>\n\n"
+            "<|Assistentin|>"
+        )
+        return prompt.rstrip() + retry_note
+
+    if is_gpt_oss_model(model_id):
+        return (
+            prompt.rstrip()
+            + "\n<|start|>system<|message|>"
+            "You have not answered yet. Respond directly to the user's last request."
+            "<|end|>\n"
+            "<|start|>assistant<|channel|>final<|message|>"
+        )
+
+    return (
+        prompt.rstrip()
+        + "\n\n"
+        "System: Du hast noch keine Antwort gegeben. "
+        "Beantworte jetzt direkt die letzte Benutzeranfrage.\n"
+        "Assistant:"
+    )
+
+
+def _build_retry_kwargs(kwargs: dict, attempt: int, model_id: str) -> dict:
     retry_kwargs = dict(kwargs)
 
     if retry_kwargs.get("seed") is not None:
         retry_kwargs["seed"] = int(retry_kwargs["seed"]) + attempt
 
     retry_kwargs["max_tokens"] = max(int(retry_kwargs.get("max_tokens", 0)), 64)
+
+    original_prompt = str(retry_kwargs.get("prompt", "") or "")
+    retry_kwargs["prompt"] = _inject_empty_response_retry_prompt(original_prompt, model_id, attempt)
+
     return retry_kwargs
 
 
-def create_completion_with_empty_retry(llm: BaseLLM, kwargs: dict):
+def create_completion_with_empty_retry(llm: BaseLLM, kwargs: dict, model_id: str):
     last_result = None
 
     for attempt in range(EMPTY_RESPONSE_RETRIES + 1):
-        current_kwargs = _build_retry_kwargs(kwargs, attempt)
+        current_kwargs = _build_retry_kwargs(kwargs, attempt, model_id)
         result = llm.create_completion(**current_kwargs)
         last_result = result
 
@@ -1063,11 +1117,11 @@ def create_completion_with_empty_retry(llm: BaseLLM, kwargs: dict):
     return last_result
 
 
-def _streaming_iterator_with_empty_retry(llm: BaseLLM, kwargs: dict):
+def _streaming_iterator_with_empty_retry(llm: BaseLLM, kwargs: dict, model_id: str):
     last_iterator = None
 
     for attempt in range(EMPTY_RESPONSE_RETRIES + 1):
-        current_kwargs = _build_retry_kwargs(kwargs, attempt)
+        current_kwargs = _build_retry_kwargs(kwargs, attempt, model_id)
         iterator = llm.create_completion(**current_kwargs)
         last_iterator = iterator
 
@@ -1137,7 +1191,7 @@ def non_stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lo
         kwargs = build_completion_kwargs(body, prompt, stream=False, max_tokens=max_new, model_id=model_id)
         print(f"[STOP SEQS] {kwargs.get('stop')}", flush=True)
 
-        result = create_completion_with_empty_retry(llm, kwargs)
+        result = create_completion_with_empty_retry(llm, kwargs, model_id)
         choice = result["choices"][0]
         text = choice.get("text", "")
         finish_reason = choice.get("finish_reason", "stop")
@@ -1204,7 +1258,7 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
 
             kwargs = build_completion_kwargs(body, prompt, stream=True, max_tokens=max_new, model_id=model_id)
             print(f"[STOP SEQS] {kwargs.get('stop')}", flush=True)
-            iterator = _streaming_iterator_with_empty_retry(llm, kwargs)
+            iterator = _streaming_iterator_with_empty_retry(llm, kwargs, model_id)
 
         buf = ""
         last_flush = time.monotonic()
