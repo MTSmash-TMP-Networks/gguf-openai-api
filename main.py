@@ -38,10 +38,6 @@ from jinja2 import Environment, BaseLoader
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("LLAMA_LOG_LEVEL", "info")
 
-if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
 # --------------------------------------------------
 # Konfiguration (ENV)
 # --------------------------------------------------
@@ -53,7 +49,7 @@ N_THREADS = int(os.getenv("LLAMA_N_THREADS", str(os.cpu_count() or 4)))
 N_GPU_LAYERS = int(os.getenv("LLAMA_N_GPU_LAYERS", "-1"))
 N_BATCH = int(os.getenv("LLAMA_N_BATCH", "512"))
 
-DEFAULT_MAX_NEW_TOKENS = int(os.getenv("LLAMA_DEFAULT_MAX_TOKENS", "4096"))
+DEFAULT_MAX_NEW_TOKENS = int(os.getenv("LLAMA_DEFAULT_MAX_TOKENS", "1024"))
 CONTEXT_MARGIN_TOKENS = int(os.getenv("LLAMA_CONTEXT_MARGIN_TOKENS", "64"))
 MIN_PROMPT_BUDGET_TOKENS = int(os.getenv("LLAMA_MIN_PROMPT_BUDGET_TOKENS", "256"))
 
@@ -65,7 +61,7 @@ STREAM_TIMEOUT_SEC = float(os.getenv("LLAMA_STREAM_TIMEOUT_SEC", "60.0"))
 # Retry / Empty-Response-Handling
 # --------------------------------------------------
 EMPTY_RESPONSE_RETRIES = int(os.getenv("EMPTY_RESPONSE_RETRIES", "1"))
-EMPTY_RESPONSE_MIN_CHARS = int(os.getenv("EMPTY_RESPONSE_MIN_CHARS", "3"))
+EMPTY_RESPONSE_MIN_CHARS = int(os.getenv("EMPTY_RESPONSE_MIN_CHARS", "1"))
 RETRY_BACKOFF_SEC = float(os.getenv("RETRY_BACKOFF_SEC", "0.15"))
 
 # --------------------------------------------------
@@ -343,26 +339,6 @@ def render_messages_to_prompt_hf(messages: List["ChatMessage"], hf_llm: "HFLLM")
     return "\n".join(convo) + "\nAssistant:"
 
 
-def tokenize_messages_hf(messages: List["ChatMessage"], hf_llm: "HFLLM"):
-    tok = hf_llm.tokenizer
-    msgs = [{"role": m.role, "content": m.content} for m in messages]
-
-    if hasattr(tok, "apply_chat_template") and callable(getattr(tok, "apply_chat_template")):
-        try:
-            return tok.apply_chat_template(
-                msgs,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_tensors="pt",
-                return_dict=True,
-            )
-        except Exception as e:
-            print(f"[HF] apply_chat_template(tokenize=True) failed -> fallback: {type(e).__name__}: {e}", flush=True)
-
-    prompt = render_messages_to_prompt_hf(messages, hf_llm)
-    return tok(prompt, return_tensors="pt", add_special_tokens=False)
-
-
 class HFLLM(BaseLLM):
     def __init__(self, cfg: dict):
         self.backend = "hf"
@@ -376,28 +352,10 @@ class HFLLM(BaseLLM):
         template_ok = _maybe_load_hf_chat_template_from_file(self.model_path, self.tokenizer)
         print(f"[HF] model={self.model_path} chat_template_found={template_ok}", flush=True)
 
-        if device == "cuda":
-            if torch.cuda.is_bf16_supported():
-                dtype = torch.bfloat16
-            else:
-                dtype = torch.float16
-        else:
-            dtype = torch.float32
-
-        model_kwargs = {
-            "torch_dtype": dtype,
-            "low_cpu_mem_usage": True,
-        }
-        if device == "cuda":
-            model_kwargs["device_map"] = "auto"
-            try:
-                model_kwargs["attn_implementation"] = "sdpa"
-            except Exception:
-                pass
-
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_path,
-            **model_kwargs,
+            dtype=torch.float16 if device == "cuda" else torch.float32,
+            device_map="auto" if device == "cuda" else None,
         )
         self.model.eval()
 
@@ -412,79 +370,12 @@ class HFLLM(BaseLLM):
 
     def _filter_gen_kwargs(self, gen_kwargs: dict) -> dict:
         allowed = set(self.model.generation_config.to_dict().keys())
-        runtime_allowed = {"streamer", "stopping_criteria", "logits_processor", "generator", "use_cache"}
+        runtime_allowed = {"streamer", "stopping_criteria", "logits_processor", "generator"}
         out = {}
         for k, v in gen_kwargs.items():
             if k in allowed or k in runtime_allowed:
                 out[k] = v
         return out
-
-    def _build_generator(self, device, seed: Optional[int]):
-        if seed is None:
-            return None
-        s = int(seed)
-        generator = torch.Generator(device=device)
-        generator.manual_seed(s)
-        torch.manual_seed(s)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(s)
-        return generator
-
-    def _build_stopping(self, stop: Optional[List[str]]):
-        if stop == ["</s>"]:
-            stop = None
-        if not stop:
-            return None
-        stop_token_ids = [self.tokenizer.encode(s, add_special_tokens=False) for s in stop if s]
-        if stop_token_ids:
-            return StoppingCriteriaList([_StopOnSequences(stop_token_ids)])
-        return None
-
-    def _build_logits_processor(self, presence_penalty: Optional[float], frequency_penalty: Optional[float]):
-        pp = 0.0 if presence_penalty is None else float(presence_penalty)
-        fp = 0.0 if frequency_penalty is None else float(frequency_penalty)
-        if pp != 0.0 or fp != 0.0:
-            return LogitsProcessorList([_OpenAIPenaltiesLogitsProcessor(pp, fp)])
-        return None
-
-    def _build_gen_kwargs(
-        self,
-        *,
-        max_tokens: int,
-        temperature: Optional[float],
-        top_p: Optional[float],
-        top_k: Optional[int],
-        min_p: Optional[float],
-        typical_p: Optional[float],
-        repeat_penalty: Optional[float],
-        generator,
-        stopping_criteria,
-        logits_processor,
-    ) -> dict:
-        temp = 1.0 if temperature is None else float(temperature)
-        do_sample = temp > 0.0
-        if not do_sample:
-            temp = 1.0
-
-        gen_kwargs = {
-            "max_new_tokens": int(max_tokens),
-            "do_sample": bool(do_sample),
-            "temperature": float(temp),
-            "top_p": 1.0 if top_p is None else float(top_p),
-            "top_k": int(top_k) if top_k is not None else None,
-            "typical_p": float(typical_p) if typical_p is not None else None,
-            "min_p": float(min_p) if min_p is not None else None,
-            "repetition_penalty": float(repeat_penalty) if repeat_penalty is not None else None,
-            "eos_token_id": self.tokenizer.eos_token_id,
-            "use_cache": True,
-            "stopping_criteria": stopping_criteria,
-            "logits_processor": logits_processor,
-            "generator": generator,
-            "num_beams": 1,
-            "num_return_sequences": 1,
-        }
-        gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
-        return self._filter_gen_kwargs(gen_kwargs)
 
     def create_completion(
         self,
@@ -505,29 +396,61 @@ class HFLLM(BaseLLM):
     ):
         device = next(self.model.parameters()).device
 
-        inputs = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        inputs = self.tokenizer(prompt, return_tensors="pt")
         inputs = _force_batch_size_1(inputs)
         inputs = inputs.to(device)
 
-        generator = self._build_generator(device, seed)
-        stopping_criteria = self._build_stopping(stop)
-        logits_processor = self._build_logits_processor(presence_penalty, frequency_penalty)
+        generator = None
+        if seed is not None:
+            s = int(seed)
+            generator = torch.Generator(device=device)
+            generator.manual_seed(s)
+            torch.manual_seed(s)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(s)
 
-        gen_kwargs = self._build_gen_kwargs(
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            typical_p=typical_p,
-            repeat_penalty=repeat_penalty,
-            generator=generator,
-            stopping_criteria=stopping_criteria,
-            logits_processor=logits_processor,
-        )
+        if stop == ["</s>"]:
+            stop = None
+
+        stopping_criteria = None
+        if stop:
+            stop_token_ids = [self.tokenizer.encode(s, add_special_tokens=False) for s in stop if s]
+            if stop_token_ids:
+                stopping_criteria = StoppingCriteriaList([_StopOnSequences(stop_token_ids)])
+
+        temp = 1.0 if temperature is None else float(temperature)
+        do_sample = temp > 0.0
+        if not do_sample:
+            temp = 1.0
+
+        logits_processor = None
+        pp = 0.0 if presence_penalty is None else float(presence_penalty)
+        fp = 0.0 if frequency_penalty is None else float(frequency_penalty)
+        if pp != 0.0 or fp != 0.0:
+            logits_processor = LogitsProcessorList([_OpenAIPenaltiesLogitsProcessor(pp, fp)])
+
+        gen_kwargs = {
+            "max_new_tokens": int(max_tokens),
+            "do_sample": bool(do_sample),
+            "temperature": float(temp),
+            "top_p": 1.0 if top_p is None else float(top_p),
+            "top_k": int(top_k) if top_k is not None else None,
+            "typical_p": float(typical_p) if typical_p is not None else None,
+            "min_p": float(min_p) if min_p is not None else None,
+            "repetition_penalty": float(repeat_penalty) if repeat_penalty is not None else None,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "stopping_criteria": stopping_criteria,
+            "logits_processor": logits_processor,
+            "generator": generator,
+
+            "num_beams": 1,
+            "num_return_sequences": 1,
+        }
+        gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
+        gen_kwargs = self._filter_gen_kwargs(gen_kwargs)
 
         if not stream:
-            with torch.inference_mode():
+            with torch.no_grad():
                 out = self.model.generate(**inputs, **gen_kwargs)
             gen_tokens = out[0][inputs["input_ids"].shape[-1]:]
             text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True)
@@ -544,105 +467,7 @@ class HFLLM(BaseLLM):
 
         def _run_generate():
             try:
-                with torch.inference_mode():
-                    self.model.generate(**inputs, **gen_kwargs_stream)
-            except Exception as e:
-                q.put(e)
-            finally:
-                done_evt.set()
-
-        def _run_streamer_to_queue():
-            try:
-                for piece in streamer:
-                    if piece:
-                        q.put(piece)
-            except Exception as e:
-                q.put(e)
-            finally:
-                done_evt.wait(timeout=5.0)
-                q.put(None)
-
-        threading.Thread(target=_run_generate, daemon=True).start()
-        threading.Thread(target=_run_streamer_to_queue, daemon=True).start()
-
-        def iterator():
-            while True:
-                try:
-                    item = q.get(timeout=STREAM_TIMEOUT_SEC)
-                except queue.Empty:
-                    raise TimeoutError("no tokens generated within timeout window")
-
-                if item is None:
-                    yield {"choices": [{"text": "", "finish_reason": "stop"}]}
-                    return
-                if isinstance(item, Exception):
-                    raise item
-
-                yield {"choices": [{"text": item, "finish_reason": None}]}
-
-        return iterator()
-
-    def create_chat_completion_from_messages(
-        self,
-        *,
-        messages: List["ChatMessage"],
-        max_tokens: int,
-        stream: bool = False,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        top_k: Optional[int] = None,
-        min_p: Optional[float] = None,
-        typical_p: Optional[float] = None,
-        repeat_penalty: Optional[float] = None,
-        seed: Optional[int] = None,
-        presence_penalty: Optional[float] = None,
-        frequency_penalty: Optional[float] = None,
-        stop: Optional[List[str]] = None,
-    ):
-        device = next(self.model.parameters()).device
-
-        inputs = tokenize_messages_hf(messages, self)
-        inputs = _force_batch_size_1(inputs)
-        inputs = inputs.to(device)
-
-        generator = self._build_generator(device, seed)
-        stopping_criteria = self._build_stopping(stop)
-        logits_processor = self._build_logits_processor(presence_penalty, frequency_penalty)
-
-        gen_kwargs = self._build_gen_kwargs(
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            typical_p=typical_p,
-            repeat_penalty=repeat_penalty,
-            generator=generator,
-            stopping_criteria=stopping_criteria,
-            logits_processor=logits_processor,
-        )
-
-        prompt_len = inputs["input_ids"].shape[-1]
-
-        if not stream:
-            with torch.inference_mode():
-                out = self.model.generate(**inputs, **gen_kwargs)
-            gen_tokens = out[0][prompt_len:]
-            text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True)
-            return {"choices": [{"text": text, "finish_reason": "stop"}]}
-
-        q: "queue.Queue[Union[str, Exception, None]]" = queue.Queue()
-        streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
-
-        gen_kwargs_stream = dict(gen_kwargs)
-        gen_kwargs_stream["streamer"] = streamer
-        gen_kwargs_stream = self._filter_gen_kwargs(gen_kwargs_stream)
-
-        done_evt = threading.Event()
-
-        def _run_generate():
-            try:
-                with torch.inference_mode():
+                with torch.no_grad():
                     self.model.generate(**inputs, **gen_kwargs_stream)
             except Exception as e:
                 q.put(e)
@@ -886,13 +711,12 @@ def is_gpt_oss_model(model_id: Optional[str]) -> bool:
     return bool(model_id) and ("gpt-oss" in model_id.lower())
 
 
-def should_use_evagpt_prompt(model_id: Optional[str]) -> bool:
+def should_skip_gguf_template(model_id: Optional[str]) -> bool:
     mid = (model_id or "").lower()
-    forced_models = {
+    blocked_models = {
         "evagpt-german-x-llamatok-de-7b-f16",
-        "evagpt-german-v9-1-2-4-7-latest",
     }
-    return mid in forced_models
+    return mid in blocked_models
 
 
 def render_messages_to_prompt_harmony(messages: List[ChatMessage]) -> str:
@@ -937,66 +761,51 @@ def _compile_chat_template(template_str: str):
 
 
 def render_messages_to_prompt(messages: List[ChatMessage]) -> str:
-    """
-    EvaGPT Turn-Format:
-
-    <|System|>
-    {system}</s>
-
-    <|Benutzer|>
-    ...
-    </s>
-
-    <|Assistentin|>
-    ...
-    </s>
-
-    <|Benutzer|>
-    ...
-    </s>
-
-    <|Assistentin|>
-    """
     if not messages:
-        return "<|System|>\n\n</s>\n\n<|Benutzer|>\n\n</s>\n\n<|Assistentin|>"
+        return "<|System|>\n</s>\n<|Benutzer|>\n</s>\n<|Assistentin|>"
 
-    system_parts = [m.content for m in messages if m.role == "system" and (m.content or "").strip()]
-    system_text = "\n\n".join(system_parts).strip()
+    system_parts = [m.content for m in messages if m.role == "system"]
+    system_text = "\n".join(system_parts).strip()
 
-    convo_parts: List[str] = []
-    non_system_msgs = [m for m in messages if m.role != "system"]
+    last_user_idx: Optional[int] = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].role == "user":
+            last_user_idx = i
+            break
+    if last_user_idx is None:
+        last_user_idx = len(messages) - 1
 
-    for m in non_system_msgs:
-        content = (m.content or "").strip()
-        if not content:
-            continue
+    prompt_msg = messages[last_user_idx].content
 
-        if m.role == "user":
-            convo_parts.append("<|Benutzer|>")
-            convo_parts.append(content)
-            convo_parts.append("</s>")
-        elif m.role == "assistant":
-            convo_parts.append("<|Assistentin|>")
-            convo_parts.append(content)
-            convo_parts.append("</s>")
-
-    if not non_system_msgs or non_system_msgs[-1].role != "user":
-        convo_parts.append("<|Benutzer|>")
-        convo_parts.append("")
-        convo_parts.append("</s>")
-
-    prompt_parts: List[str] = [
-        "<|System|>",
-        system_text,
-        "</s>",
+    history_msgs: List[ChatMessage] = [
+        m for i, m in enumerate(messages)
+        if i < last_user_idx and m.role != "system"
     ]
 
-    if convo_parts:
-        prompt_parts.append("\n\n".join(convo_parts))
+    history_lines: List[str] = []
+    for m in history_msgs:
+        if m.role == "user":
+            history_lines.append("<|Benutzer|>")
+            history_lines.append(m.content)
+            history_lines.append("</s>")
+        elif m.role == "assistant":
+            history_lines.append("<|Assistentin|>")
+            history_lines.append(m.content)
+            history_lines.append("</s>")
 
-    prompt_parts.append("<|Assistentin|>")
+    history_text = "\n".join(history_lines) + "\n" if history_lines else ""
 
-    return "\n\n".join(prompt_parts)
+    parts: List[str] = []
+    parts.append("<|System|>")
+    parts.append(system_text)
+    parts.append("</s>")
+    if history_text:
+        parts.append(history_text.rstrip("\n"))
+    parts.append("<|Benutzer|>")
+    parts.append(prompt_msg)
+    parts.append("</s>")
+    parts.append("<|Assistentin|>")
+    return "\n".join(parts)
 
 
 def render_messages_to_prompt_gguf(messages: List[ChatMessage], llm: GGUFLLM, model_id: Optional[str] = None) -> str:
@@ -1042,11 +851,11 @@ def render_messages_auto(llm: BaseLLM, messages: List[ChatMessage], model_id: st
     if is_gpt_oss_model(model_id):
         return render_messages_to_prompt_harmony(messages)
 
-    if should_use_evagpt_prompt(model_id):
-        return render_messages_to_prompt(messages)
-
     if getattr(llm, "backend", None) == "hf":
         return render_messages_to_prompt_hf(messages, llm)  # type: ignore[arg-type]
+
+    if should_skip_gguf_template(model_id):
+        return render_messages_to_prompt(messages)
 
     if isinstance(llm, GGUFLLM) and getattr(llm, "chat_template", None):
         return render_messages_to_prompt_gguf(messages, llm, model_id)
@@ -1217,61 +1026,21 @@ def _is_effectively_empty_text(text: Optional[str]) -> bool:
     return len(text.strip()) < EMPTY_RESPONSE_MIN_CHARS
 
 
-def _inject_empty_response_retry_prompt(prompt: str, model_id: str, attempt: int) -> str:
-    """
-    Gibt dem Modell bei leerer Antwort einen zweiten, klareren Anlauf.
-    """
-    if attempt <= 0:
-        return prompt
-
-    if should_use_evagpt_prompt(model_id):
-        retry_note = (
-            "\n\n"
-            "<|System|>\n"
-            "Du hast noch keine Antwort gegeben. "
-            "Beantworte jetzt direkt die letzte Benutzeranfrage inhaltlich und vollständig."
-            "\n</s>\n\n"
-            "<|Assistentin|>"
-        )
-        return prompt.rstrip() + retry_note
-
-    if is_gpt_oss_model(model_id):
-        return (
-            prompt.rstrip()
-            + "\n<|start|>system<|message|>"
-            "You have not answered yet. Respond directly to the user's last request."
-            "<|end|>\n"
-            "<|start|>assistant<|channel|>final<|message|>"
-        )
-
-    return (
-        prompt.rstrip()
-        + "\n\n"
-        "System: Du hast noch keine Antwort gegeben. "
-        "Beantworte jetzt direkt die letzte Benutzeranfrage.\n"
-        "Assistant:"
-    )
-
-
-def _build_retry_kwargs(kwargs: dict, attempt: int, model_id: str) -> dict:
+def _build_retry_kwargs(kwargs: dict, attempt: int) -> dict:
     retry_kwargs = dict(kwargs)
 
     if retry_kwargs.get("seed") is not None:
         retry_kwargs["seed"] = int(retry_kwargs["seed"]) + attempt
 
     retry_kwargs["max_tokens"] = max(int(retry_kwargs.get("max_tokens", 0)), 64)
-
-    original_prompt = str(retry_kwargs.get("prompt", "") or "")
-    retry_kwargs["prompt"] = _inject_empty_response_retry_prompt(original_prompt, model_id, attempt)
-
     return retry_kwargs
 
 
-def create_completion_with_empty_retry(llm: BaseLLM, kwargs: dict, model_id: str):
+def create_completion_with_empty_retry(llm: BaseLLM, kwargs: dict):
     last_result = None
 
     for attempt in range(EMPTY_RESPONSE_RETRIES + 1):
-        current_kwargs = _build_retry_kwargs(kwargs, attempt, model_id)
+        current_kwargs = _build_retry_kwargs(kwargs, attempt)
         result = llm.create_completion(**current_kwargs)
         last_result = result
 
@@ -1294,11 +1063,11 @@ def create_completion_with_empty_retry(llm: BaseLLM, kwargs: dict, model_id: str
     return last_result
 
 
-def _streaming_iterator_with_empty_retry(llm: BaseLLM, kwargs: dict, model_id: str):
+def _streaming_iterator_with_empty_retry(llm: BaseLLM, kwargs: dict):
     last_iterator = None
 
     for attempt in range(EMPTY_RESPONSE_RETRIES + 1):
-        current_kwargs = _build_retry_kwargs(kwargs, attempt, model_id)
+        current_kwargs = _build_retry_kwargs(kwargs, attempt)
         iterator = llm.create_completion(**current_kwargs)
         last_iterator = iterator
 
@@ -1368,25 +1137,7 @@ def non_stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lo
         kwargs = build_completion_kwargs(body, prompt, stream=False, max_tokens=max_new, model_id=model_id)
         print(f"[STOP SEQS] {kwargs.get('stop')}", flush=True)
 
-        if getattr(llm, "backend", None) == "hf" and hasattr(llm, "create_chat_completion_from_messages"):
-            result = llm.create_chat_completion_from_messages(
-                messages=_final_msgs,
-                max_tokens=max_new,
-                stream=False,
-                temperature=body.temperature,
-                top_p=body.top_p,
-                top_k=body.top_k,
-                min_p=body.min_p,
-                typical_p=body.typical_p,
-                repeat_penalty=body.repeat_penalty,
-                seed=body.seed,
-                presence_penalty=body.presence_penalty,
-                frequency_penalty=body.frequency_penalty,
-                stop=normalize_stop_for_model(body.stop, model_id),
-            )
-        else:
-            result = create_completion_with_empty_retry(llm, kwargs, model_id)
-
+        result = create_completion_with_empty_retry(llm, kwargs)
         choice = result["choices"][0]
         text = choice.get("text", "")
         finish_reason = choice.get("finish_reason", "stop")
@@ -1453,25 +1204,7 @@ def stream_chat(llm: BaseLLM, body: ChatCompletionRequest, model_id: str, lock: 
 
             kwargs = build_completion_kwargs(body, prompt, stream=True, max_tokens=max_new, model_id=model_id)
             print(f"[STOP SEQS] {kwargs.get('stop')}", flush=True)
-
-            if getattr(llm, "backend", None) == "hf" and hasattr(llm, "create_chat_completion_from_messages"):
-                iterator = llm.create_chat_completion_from_messages(
-                    messages=_final_msgs,
-                    max_tokens=max_new,
-                    stream=True,
-                    temperature=body.temperature,
-                    top_p=body.top_p,
-                    top_k=body.top_k,
-                    min_p=body.min_p,
-                    typical_p=body.typical_p,
-                    repeat_penalty=body.repeat_penalty,
-                    seed=body.seed,
-                    presence_penalty=body.presence_penalty,
-                    frequency_penalty=body.frequency_penalty,
-                    stop=normalize_stop_for_model(body.stop, model_id),
-                )
-            else:
-                iterator = _streaming_iterator_with_empty_retry(llm, kwargs, model_id)
+            iterator = _streaming_iterator_with_empty_retry(llm, kwargs)
 
         buf = ""
         last_flush = time.monotonic()
